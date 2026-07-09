@@ -1,6 +1,13 @@
+import os
 import sqlite3
 import pytest
 from pathlib import Path
+
+# The suite never loads the embedding model (tests patch _get_model/_get_tokenizer).
+# These guarantee a stray import can never reach the HuggingFace hub.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 @pytest.fixture
@@ -86,6 +93,14 @@ def zotero_db(tmp_path):
         INSERT INTO collectionItems VALUES (1, 2);
         INSERT INTO collectionItems VALUES (2, 1);
         INSERT INTO collectionItems VALUES (2, 4);
+
+        CREATE TABLE itemAttachments (
+            itemID       INTEGER PRIMARY KEY,
+            parentItemID INTEGER,
+            linkMode     INTEGER,
+            contentType  TEXT,
+            path         TEXT
+        );
     """)
     conn.commit()
     conn.close()
@@ -105,6 +120,15 @@ def embeddings_db(tmp_path):
             zotero_key TEXT PRIMARY KEY,
             vector     BLOB NOT NULL,
             embedded_at TEXT NOT NULL
+        );
+        -- Legacy mean-pooled table. Retired (never written, never read) but kept
+        -- in the fixture so the "we no longer read it" tests can poison it.
+        CREATE TABLE fulltext_embeddings (
+            zotero_key  TEXT PRIMARY KEY,
+            vector      BLOB NOT NULL,
+            embedded_at TEXT NOT NULL,
+            n_tokens    INTEGER,
+            n_chunks    INTEGER
         );
         CREATE TABLE meta (
             key   TEXT PRIMARY KEY,
