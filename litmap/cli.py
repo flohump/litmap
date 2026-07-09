@@ -26,6 +26,27 @@ def _auto_sync(db_path: Path, zotero_db: Path) -> None:
         _fatal(str(e), code=2)
 
 
+def _delete_manuscript_row(db_path: Path) -> None:
+    """Remove the transient manuscript vector from the embeddings table.
+
+    `map --manuscript` inserts one so the manuscript can be laid out alongside
+    the papers. It is not a paper, and leaving it behind pollutes every later
+    search and cluster.
+    """
+    import sqlite3
+    from litmap.embedder import MANUSCRIPT_KEY
+    if not Path(db_path).exists():
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM embeddings WHERE zotero_key = ?", (MANUSCRIPT_KEY,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
 @app.command("map")
 def map_cmd(
     collection: Optional[str] = typer.Option(None, "--collection", "-c", help="Zotero collection name"),
@@ -44,7 +65,7 @@ def map_cmd(
     """Generate a 2D semantic map of papers."""
     from litmap.zotero import get_collection, get_all_items
     from litmap.manuscript import parse_bibliography, extract_manuscript_text, match_items_to_zotero
-    from litmap.embedder import embed_text, load_all_fulltext_embeddings as load_all_embeddings, init_db
+    from litmap.embedder import embed_text, load_all_fulltext_embeddings as load_all_embeddings, init_db, MANUSCRIPT_KEY
     from litmap.layout import compute_layout, build_graph, cluster_labels
     from litmap.renderer import render_html, render_static
     import numpy as np
@@ -52,6 +73,8 @@ def map_cmd(
     Path(output).parent.mkdir(parents=True, exist_ok=True)
 
     _auto_sync(db_path, zotero_db)
+    # Clear a manuscript vector orphaned by an earlier crashed run.
+    _delete_manuscript_row(db_path)
 
     # --- Assemble paper set -------------------------------------------------
     items = []
@@ -83,7 +106,7 @@ def map_cmd(
     if manuscript:
         ms_text = extract_manuscript_text(manuscript)
         ms_vec = embed_text(ms_text, db_path)
-        manuscript_key = "__manuscript__"
+        manuscript_key = MANUSCRIPT_KEY
         from litmap.zotero import Item
         ms_item = Item(
             key=manuscript_key,
@@ -105,44 +128,49 @@ def map_cmd(
         conn.commit()
         conn.close()
 
-    # --- Load embeddings ----------------------------------------------------
-    keys = [i.key for i in items]
-    matrix, loaded_keys = load_all_embeddings(db_path, scope_keys=keys)
-    dropped = len(keys) - len(loaded_keys)
-    if dropped > 0:
-        typer.echo(
-            f"Note: {dropped} of {len(keys)} papers have no embedding yet and were skipped. "
-            f"Run `litmap sync` to embed them.",
-            err=True,
-        )
-    if len(loaded_keys) < 2:
-        typer.echo("Need at least 2 embedded papers.", err=True)
-        raise typer.Exit(1)
+    try:
+        # --- Load embeddings ------------------------------------------------
+        keys = [i.key for i in items]
+        matrix, loaded_keys = load_all_embeddings(db_path, scope_keys=keys)
+        dropped = len(keys) - len(loaded_keys)
+        if dropped > 0:
+            typer.echo(
+                f"Note: {dropped} of {len(keys)} papers have no embedding yet and were skipped. "
+                f"Run `litmap sync` to embed them.",
+                err=True,
+            )
+        if len(loaded_keys) < 2:
+            typer.echo("Need at least 2 embedded papers.", err=True)
+            raise typer.Exit(1)
 
-    # Re-align items to loaded_keys order
-    key_order = {k: idx for idx, k in enumerate(loaded_keys)}
-    items = [i for i in items if i.key in key_order]
+        # Re-align items to loaded_keys order
+        key_order = {k: idx for idx, k in enumerate(loaded_keys)}
+        items = [i for i in items if i.key in key_order]
 
-    # --- Layout + graph -----------------------------------------------------
-    center_key = manuscript_key if (center_manuscript and manuscript_key) else None
-    layout = compute_layout(matrix, loaded_keys, n_neighbors=n_neighbors, center_key=center_key)
-    edges = build_graph(matrix, loaded_keys, k=edge_k)
+        # --- Layout + graph -------------------------------------------------
+        center_key = manuscript_key if (center_manuscript and manuscript_key) else None
+        layout = compute_layout(matrix, loaded_keys, n_neighbors=n_neighbors, center_key=center_key)
+        edges = build_graph(matrix, loaded_keys, k=edge_k)
 
-    # --- Cluster labels -----------------------------------------------------
-    annotations = {}
-    if label_clusters and len(loaded_keys) >= min_cluster_size * 2:
-        annotations = cluster_labels(layout, items, min_cluster_size=min_cluster_size)
-        typer.echo(f"Found {len(annotations)} clusters.", err=True)
+        # --- Cluster labels -------------------------------------------------
+        annotations = {}
+        if label_clusters and len(loaded_keys) >= min_cluster_size * 2:
+            annotations = cluster_labels(layout, items, min_cluster_size=min_cluster_size)
+            typer.echo(f"Found {len(annotations)} clusters.", err=True)
 
-    # --- Render -------------------------------------------------------------
-    if fmt in ("html", "all"):
-        html = render_html(layout, edges, items, manuscript_key, cluster_annotations=annotations)
-        html_path = Path(str(output) + ".html")
-        html_path.write_text(html)
-        typer.echo(f"Wrote {html_path}")
-    if fmt in ("png", "pdf", "all"):
-        render_static(layout, edges, items, manuscript_key, path=output, cluster_annotations=annotations)
-        typer.echo(f"Wrote {output}.png and {output}.pdf")
+        # --- Render ---------------------------------------------------------
+        if fmt in ("html", "all"):
+            html = render_html(layout, edges, items, manuscript_key, cluster_annotations=annotations)
+            html_path = Path(str(output) + ".html")
+            html_path.write_text(html)
+            typer.echo(f"Wrote {html_path}")
+        if fmt in ("png", "pdf", "all"):
+            render_static(layout, edges, items, manuscript_key, path=output, cluster_annotations=annotations)
+            typer.echo(f"Wrote {output}.png and {output}.pdf")
+    finally:
+        # Success, error or Exit: the manuscript vector must not outlive the command.
+        if manuscript:
+            _delete_manuscript_row(db_path)
 
 
 @app.command("search")
@@ -152,6 +180,9 @@ def search_cmd(
     collection: Optional[str] = typer.Option(None, "--collection", "-c", help="Scope to collection"),
     top_k: int = typer.Option(10, "--top-k", "-k", help="Number of results"),
     fmt: str = typer.Option("table", "--format", "-f", help="table | json"),
+    judge: bool = typer.Option(False, "--judge", help="Rerank results with a local ollama judge model"),
+    judge_model: str = typer.Option("gemma4:26b", "--judge-model", help="Ollama model used by --judge"),
+    judge_url: str = typer.Option("http://localhost:11434", "--judge-url", help="Ollama base URL"),
     db_path: Path = typer.Option(_DEFAULT_DB, hidden=True),
     zotero_db: Path = typer.Option(_DEFAULT_ZOTERO, hidden=True),
 ):
@@ -214,13 +245,27 @@ def search_cmd(
 
     enriched = deduplicate_results(enriched_all, top_k=top_k)
 
+    judge_meta = None
+    if judge:
+        from litmap.judge import judge_results, JudgeError
+        try:
+            enriched = judge_results(query_text, enriched, model=judge_model, base_url=judge_url)
+            judge_meta = {"applied": True, "model": judge_model}
+        except JudgeError as e:
+            typer.echo(f"judge unavailable: {e} - returning unjudged results", err=True)
+            judge_meta = {"applied": False, "model": judge_model, "error": str(e)}
+
     if fmt == "json":
+        # Additive only: two skills parse the legacy keys of `results`.
         out = {"query": query_text[:120], "results": enriched}
+        if judge_meta is not None:
+            out["judge"] = judge_meta
         typer.echo(json.dumps(out, ensure_ascii=False))
     else:
         for i, r in enumerate(enriched, 1):
             authors = ", ".join(r["authors"][:2])
-            typer.echo(f"{i:2}. [{r['similarity']:.3f}] {r['title'][:60]}")
+            badge = f" [J{r['judge_score']}]" if "judge_score" in r else ""
+            typer.echo(f"{i:2}. [{r['similarity']:.3f}]{badge} {r['title'][:60]}")
             typer.echo(f"     {authors} {r['year']}  {r['doi']}")
 
 
