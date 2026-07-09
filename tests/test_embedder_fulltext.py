@@ -304,6 +304,37 @@ def test_sync_fulltext_rejects_bad_window_before_any_work(
     assert _chunk_rows(embeddings_db) == []
 
 
+def test_cli_max_tokens_alias_is_deprecated_but_honoured(
+    embeddings_db, zotero_db_with_pdfs, fake_encoders
+):
+    from typer.testing import CliRunner
+    from litmap.cli import app
+
+    result = CliRunner().invoke(
+        app,
+        ["sync-fulltext", "--max-tokens", "600",
+         "--db-path", str(embeddings_db), "--zotero-db", str(zotero_db_with_pdfs)],
+    )
+    assert result.exit_code == 0
+    assert "deprecated" in result.output
+    # 1200 tokens, window 600 stride 536 -> (0,600) (536,1136) (1072,1200)
+    assert _chunk_rows(embeddings_db, "PAPER001") == [(0, 600), (1, 600), (2, 128)]
+
+
+def test_cli_reports_bad_window_without_traceback(embeddings_db, zotero_db_with_pdfs, fake_encoders):
+    from typer.testing import CliRunner
+    from litmap.cli import app
+
+    result = CliRunner().invoke(
+        app,
+        ["sync-fulltext", "--chunk-tokens", "100", "--chunk-overlap", "100",
+         "--db-path", str(embeddings_db), "--zotero-db", str(zotero_db_with_pdfs)],
+    )
+    assert result.exit_code == 1
+    assert "chunk_overlap" in result.output
+    assert "Traceback" not in result.output
+
+
 # --------------------------------------------------------------------------
 # Schema + map/cluster loader
 # --------------------------------------------------------------------------

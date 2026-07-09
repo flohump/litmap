@@ -9,11 +9,11 @@ Everything runs locally — no background daemon, no network calls after the fir
 ## Features
 
 - **`litmap map`** — UMAP scatter plot of papers with k-nearest-neighbour edges, coloured by semantic position. Cluster labels generated automatically via HDBSCAN + TF-IDF. Outputs interactive Plotly HTML and publication-quality PNG/PDF (300 DPI).
-- **`litmap search`** — Cosine similarity search over your Zotero library for a query sentence, passage, or focal paper. Uses full-text embeddings when available, otherwise title+abstract. Outputs a ranked table or JSON.
+- **`litmap search`** — Cosine similarity search over your Zotero library for a query sentence, passage, or focal paper. A paper is scored by its single best full-text chunk, so a relevant section is found even in a long paper mostly about something else; papers without full text fall back to title+abstract. Optional `--judge` reranks the shortlist with a local ollama model. Outputs a ranked table or JSON.
 - **`litmap cluster`** — Hierarchical semantic clustering (≤2 levels) of a collection, bibliography, or the whole library. Outputs an interactive dendrogram (HTML), static dendrograms (PNG/PDF), a labelled outline (Markdown + JSON), and a `.linkage.npy` cache for downstream analyses.
 - **`litmap info`** — Show embedding status for a single paper.
 - **`litmap sync`** — Manually trigger title+abstract embedding of all Zotero items.
-- **`litmap sync-fulltext`** — Embed full PDF text for items with a local PDF. Vectors are stored separately and automatically preferred over title+abstract embeddings in all commands. Safe to interrupt and resume.
+- **`litmap sync-fulltext`** — Embed full PDF text for items with a local PDF, as overlapping chunks. Used automatically in place of title+abstract wherever it exists. Safe to interrupt and resume; PDFs that cannot be read are reported rather than skipped in silence.
 - **Auto-sync** — Every command automatically embeds any Zotero items not yet in the cache before running. A `tqdm` progress bar appears during sync; silent if already up to date.
 - **Four map modes** — collection only, manuscript bibliography only, intersection, or full union.
 - **Manuscript node** — When `--manuscript` is provided, your paper appears as a red star in the map, positioned semantically among its cited works. Papers in the library that have the manuscript among their k nearest neighbours in embedding space will also draw edges to it, so the manuscript typically accumulates more edges than regular nodes.
@@ -25,6 +25,7 @@ Everything runs locally — no background daemon, no network calls after the fir
 - Python 3.11–3.13
 - [uv](https://github.com/astral-sh/uv) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - Zotero installed with a library at `~/Zotero/zotero.sqlite`
+- Optional, for `litmap search --judge`: [ollama](https://ollama.com) running locally with a chat model pulled
 
 ---
 
@@ -37,7 +38,9 @@ uv venv
 uv pip install -e .
 ```
 
-On first use, `sentence-transformers` downloads the `Alibaba-NLP/gte-modernbert-base` embedding model (~570 MB). Subsequent runs are fully offline. On Apple Silicon, inference uses Metal (MPS) automatically.
+On first use, `sentence-transformers` downloads the `Alibaba-NLP/gte-modernbert-base` embedding model (~570 MB). Subsequent runs are fully offline.
+
+Inference picks a device automatically: Metal (MPS) on Apple Silicon, else CUDA, else CPU. Override with `LITMAP_DEVICE=cpu litmap ...`.
 
 ---
 
@@ -122,9 +125,21 @@ Options:
   -c, --collection TEXT     Scope search to a collection
   -k, --top-k INT           Number of results [default: 10]
   -f, --format TEXT         table | json [default: table]
+      --judge               Rerank results with a local ollama judge model
+      --judge-model TEXT    Ollama model used by --judge [default: gemma4:26b]
+      --judge-url TEXT      Ollama base URL [default: http://localhost:11434]
 ```
 
-Searches using full-text embeddings when available, falling back to title+abstract per paper. Provide either `--query` (free text) or `--paper` (title fragment or DOI of a paper already in your library). When using `--paper`, the focal paper itself is excluded from results. Results are deduplicated by DOI before returning.
+Provide either `--query` (free text) or `--paper` (title fragment or DOI of a paper already in your library). When using `--paper`, the focal paper itself is excluded from results. Results are deduplicated by DOI and by title before returning.
+
+**Scoring.** A paper's score is the cosine of its *best-matching full-text chunk*, not of a vector averaged over the whole document. Averaging is a low-pass filter: a forty-page paper whose one relevant section answers your query is drowned out by the thirty-nine pages that do not, so it loses to a shallow paper that is vaguely on-topic throughout. Scoring by the best chunk finds the section. Papers with no full text are scored on their title+abstract vector, so a partially-embedded library degrades gracefully rather than ranking inconsistently.
+
+**`--judge`.** Embedding similarity measures whether two texts are *about the same things*. It cannot tell whether a paper actually bears on your claim — a paper arguing the opposite of your query embeds close to it. With `--judge`, the shortlist is passed to a local [ollama](https://ollama.com) model that reads each title and abstract and scores relevance from 0 to 10; results re-sort by that score, and `judge_score` / `judge_reason` are added to the JSON output. Nothing leaves the machine. Requires `ollama serve` and the model pulled (`ollama pull gemma4:26b`); if either is missing, the search returns its unjudged results and explains why on stderr rather than failing.
+
+```bash
+# Two-stage retrieval: embed wide, then judge the shortlist
+litmap search --query "does nitrogen addition reduce plant diversity" --top-k 15 --judge
+```
 
 ### `litmap cluster`
 
@@ -160,58 +175,69 @@ Options:
       --force    Re-embed all papers, even those already in the cache
 ```
 
-Embed all Zotero items (title + abstract) not yet in the cache. Runs automatically before every command, so manual invocation is rarely needed. Use `--force` to regenerate all embeddings (e.g. after switching models).
+Embed all Zotero items (title + abstract) not yet in the cache. Runs automatically before every command, so manual invocation is rarely needed.
+
+`--force` regenerates every embedding, and is the supported way to switch models: change `MODEL_NAME` in `embedder.py`, then run `litmap sync --force`. Once all vectors have been rewritten, the new model is recorded in `meta` and any full-text chunks built under the old model are cleared (re-run `sync-fulltext` to rebuild them). Forcing under the *same* model leaves full-text work untouched.
 
 ### `litmap sync-fulltext`
 
 ```
 Options:
-  -c, --collection TEXT  Scope to a Zotero collection
-      --max-tokens INT   Max tokens per chunk [default: 3000; up to 8000]
-      --force            Re-embed even already-processed PDFs
+  -c, --collection TEXT    Scope to a Zotero collection
+      --chunk-tokens INT   Tokens per chunk [default: 512]
+      --chunk-overlap INT  Token overlap between consecutive chunks [default: 64]
+      --force              Re-embed even already-processed PDFs
 ```
 
-Embeds the full text of every Zotero item that has a local PDF attachment. Text is extracted with PyMuPDF, split into non-overlapping chunks of `--max-tokens` tokens, and encoded one chunk at a time on MPS (to avoid GPU OOM on long documents). The chunk vectors are averaged and L2-normalised into a single 768-dimensional vector per paper. Vectors are stored in the `fulltext_embeddings` table and automatically preferred over title+abstract embeddings in `search`, `map`, and `cluster`. Papers without a local PDF fall back to title+abstract silently.
+Embeds the full text of every Zotero item that has a local PDF attachment. Text is extracted with PyMuPDF and split into overlapping windows of `--chunk-tokens` tokens (stepping forward by `chunk-tokens - chunk-overlap` each time, so a passage straddling a boundary still lands whole inside some chunk). Every chunk is encoded and stored as its own row in `fulltext_chunks`. `search` scores a paper by its best chunk; `map` and `cluster`, which need one point per paper, average its chunks at load time.
 
-The job is safe to interrupt and resume — already-embedded papers are skipped unless `--force` is passed. Use `--collection` to scope the run to a single collection (works for both personal and group library collections), which is useful for testing higher token counts on a smaller set before committing to a full-library run.
+The job is safe to interrupt and resume: each paper is committed in its own transaction, and already-embedded papers are skipped unless `--force` is passed. A re-run replaces a paper's chunks wholesale, so shortening a document never leaves stale chunks behind. Use `--collection` to process one collection at a time (personal or group), which is how to try a chunk size on a small set before committing to a full-library run.
+
+PDFs that cannot be read — corrupt files, scanned images with no text layer — are listed at the end of the run with their Zotero keys, instead of being silently dropped:
+
+```
+3 PDFs could not be read and have no full text:
+  ABCD1234  no extractable text (scanned PDF?)
+  EFGH5678  FileDataError: cannot open broken document
+Inspect one with: litmap info <key>
+```
+
+**Choosing `--chunk-tokens`**
+
+A chunk is the unit that gets scored, so it should be about the size of *one argument* — a few paragraphs — not one paper. Small chunks are what make a buried result findable; the point of storing chunks separately is lost if each one spans half a paper. Overlap exists so a claim split across a boundary is not cut in half.
+
+- **512 tokens (~380 words)** — roughly a long paragraph or a short subsection. The default.
+- **256 tokens** — sharper localisation of a specific claim, at more rows and more encoding calls.
+- **1024+ tokens** — coarser; a chunk starts to average over several distinct points, which is the problem chunking exists to solve. Also disproportionately slower: attention cost grows with the square of sequence length, so one 1024-token chunk costs about as much as four 512-token ones.
+
+Chunks are encoded in small batches. If a machine with little GPU memory ever reports an out-of-memory error, set `_CHUNK_BATCH_SIZE = 1` in `embedder.py` to restore strict one-chunk-at-a-time encoding.
+
+Full-library runs take hours. Throughput depends on machine, chunk size and PDF length; measure it on your own library rather than trusting a number here.
 
 ```bash
-# Embed a single collection at higher quality
-litmap sync-fulltext --collection "My Papers" --max-tokens 6000
+# Try the default on one collection first
+litmap sync-fulltext --collection "My Papers"
 
-# Re-embed a collection at 8000 tokens for richer semantic content
-litmap sync-fulltext --collection "My Papers" --max-tokens 8000 --force
+# Sharper chunks for a collection you are working through closely
+litmap sync-fulltext --collection "My Papers" --chunk-tokens 256 --force
 
-# Re-embed everything at a new token limit
-litmap sync-fulltext --max-tokens 3000 --force
+# The whole library, resumable — safe to interrupt
+litmap sync-fulltext
 ```
-
-A common workflow is to run the full library at 3000 tokens, then re-embed the specific collection you are actively working with at 8000 tokens. This gives richer semantic content for that collection — improving results from `litmap map`, `litmap cluster`, and `litmap search` — without the time cost of re-embedding your entire library.
-
-Approximate throughput on Apple Silicon (MPS) on a MacBook Air M4: ~12 s/paper at 3000 tokens, ~100 s/paper at 8000 tokens. Encoding time scales roughly as O(n^2) in token count because transformer attention computes interactions between every pair of tokens — doubling the sequence length roughly quadruples the compute. This makes 8000-token encoding disproportionately expensive; 3000 tokens is recommended.
-
-**Choosing `--max-tokens`**
-
-Token count maps roughly to 0.75 words, so 1000 tokens ≈ 750 words.
-
-- **2000 tokens (~1500 words)** — full abstract and introduction. Captures topic framing and research questions; good for subject-area similarity.
-- **3000 tokens (~2250 words)** — full abstract, introduction, and most of the methods. Adds methodological signal; recommended default.
-- **8000 tokens (~6000 words)** — abstract through most of the results. Near-complete coverage for typical journal articles, but ~8x slower per paper due to quadratic attention scaling, and risks GPU OOM on machines with limited memory.
-
-Papers shorter than `--max-tokens` are encoded in full regardless of the setting.
 
 ---
 
 ## Storage
 
-Embeddings are stored in `~/LitLake/embeddings.db` (SQLite), created automatically on first run. The database holds two tables:
+Embeddings are stored in `~/LitLake/embeddings.db` (SQLite), created automatically on first run. The database holds:
 
-- **`embeddings`** — title + abstract vectors. One row per Zotero item, ~3 KB each. Populated by `litmap sync` and auto-sync.
-- **`fulltext_embeddings`** — full-text vectors. One row per item with a local PDF, also ~3 KB each (the vector is always 768 float32 values regardless of how many chunks were averaged). Also stores `n_tokens` and `n_chunks` per paper, queryable via `litmap info` or directly with `sqlite3`.
+- **`embeddings`** — title + abstract vectors. One row per Zotero item, ~3 KB each (768 float32 values). Populated by `litmap sync` and auto-sync.
+- **`fulltext_chunks`** — full-text vectors, **one row per chunk**, keyed `(zotero_key, chunk_idx)`, ~3 KB each plus `n_tokens`. A 6000-token paper at the default window yields about 13 chunks, so roughly 40 KB per paper. Populated by `litmap sync-fulltext`.
+- **`meta`** — the embedding model and dimensionality this database was built with. Opening it with a different `MODEL_NAME` is refused: vectors from two models share no coordinate system, so similarity across them is meaningless. `litmap sync --force` re-embeds and adopts the new model.
 
-All commands prefer full-text vectors when available and fall back to title+abstract per paper — the two tables can be populated independently and at different token limits.
+`search` uses `fulltext_chunks` where a paper has it and `embeddings` otherwise, per paper — the two can be populated independently, and a half-finished `sync-fulltext` still leaves a coherent index.
 
-Approximate database sizes for a library of ~16,000 items with PDFs: `embeddings` ~50 MB, `fulltext_embeddings` ~170 MB, total ~220 MB.
+> **Legacy.** Databases created before chunked storage also contain a `fulltext_embeddings` table holding one mean-pooled vector per paper. It is no longer written or read, and no longer affects any result. Re-run `litmap sync-fulltext` to build chunks; once you are satisfied, reclaim the space with `sqlite3 ~/LitLake/embeddings.db "DROP TABLE fulltext_embeddings; VACUUM;"`.
 
 To inspect coverage:
 
@@ -219,10 +245,9 @@ To inspect coverage:
 sqlite3 ~/LitLake/embeddings.db "
 SELECT
   (SELECT COUNT(*) FROM embeddings) AS title_abstract_embedded,
-  (SELECT COUNT(*) FROM fulltext_embeddings) AS fulltext_embedded,
-  (SELECT AVG(n_tokens) FROM fulltext_embeddings) AS avg_tokens,
-  (SELECT SUM(CASE WHEN n_chunks > 1 THEN 1 ELSE 0 END)
-   FROM fulltext_embeddings) AS multi_chunk_papers;"
+  (SELECT COUNT(DISTINCT zotero_key) FROM fulltext_chunks) AS fulltext_papers,
+  (SELECT COUNT(*) FROM fulltext_chunks) AS total_chunks,
+  (SELECT value FROM meta WHERE key = 'model') AS model;"
 ```
 
 ---
@@ -254,7 +279,8 @@ litmap/
 ├── zotero.py          Read-only access to ~/Zotero/zotero.sqlite; resolves PDF paths
 ├── embedder.py        Embedding model, embeddings.db cache, fulltext pipeline
 ├── layout.py          UMAP 2D layout + HDBSCAN cluster labels + k-NN graph
-├── search.py          Cosine similarity search + deduplication
+├── search.py          Best-chunk (max-pool) similarity search + deduplication
+├── judge.py           Optional local-ollama reranker for `search --judge`
 ├── manuscript.py      Bibliography parser (PDF/DOCX/BibTeX/LaTeX)
 ├── renderer.py        Plotly HTML + matplotlib PNG/PDF (for `map`)
 ├── cluster.py         Hierarchical clustering, TF-IDF labelling, outline builder

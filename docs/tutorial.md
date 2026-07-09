@@ -45,23 +45,25 @@ Title and abstract embeddings are quick to compute but capture limited semantic 
 litmap sync-fulltext
 ```
 
-This reads each paper's local PDF, extracts the text, and stores a full-text vector alongside the title+abstract vector. All commands automatically prefer full-text embeddings when available, falling back to title+abstract per paper.
+This reads each paper's local PDF, extracts the text, and stores it as a series of overlapping 512-token chunks. `search` then scores a paper by its single best-matching chunk, so a relevant section is found even in a long paper that is mostly about something else. Papers with no local PDF keep using their title+abstract vector.
 
-**Throughput on Apple Silicon (M4):** ~12 s/paper at 3000 tokens (default), ~100 s/paper at 8000 tokens. At 3000 tokens, a 13,000-paper library takes roughly 45 hours. The database grows to approximately 170 MB for the fulltext table.
+A full-library run takes hours. Throughput depends on your machine, chunk size and PDF lengths — measure it on your own library rather than trusting a number here. The run is safe to interrupt: each paper is committed as it finishes, and re-running skips what is already done.
+
+At the end, any PDFs that could not be read are listed by Zotero key. Scanned PDFs with no text layer are the usual cause; the paper simply keeps its title+abstract vector.
 
 ### Recommended workflow
 
-Run the full library at the default token count, then re-embed the collection you are actively working with at higher quality:
+Try the default on one collection, confirm the results look right, then run the library:
 
 ```bash
-# Step 1: embed the full library (takes time; safe to interrupt and resume)
-litmap sync-fulltext
+# Step 1: one collection, default chunk size
+litmap sync-fulltext --collection Credible_Bib
 
-# Step 2: re-embed your active collection at higher quality
-litmap sync-fulltext --collection Credible_Bib --max-tokens 8000 --force
+# Step 2: the whole library (safe to interrupt and resume)
+litmap sync-fulltext
 ```
 
-`--force` with `--collection` only re-embeds papers in that collection — the rest of the library is untouched. This gives richer semantic content for your active collection without re-processing everything.
+`--force` with `--collection` re-embeds only papers in that collection — the rest of the library is untouched. Use it when trying a different `--chunk-tokens` on a small set.
 
 ### Checking a paper's embedding status
 
