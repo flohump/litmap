@@ -265,13 +265,31 @@ def info_cmd(
     typer.echo(f"\nTitle+abstract embedded: {'yes, ' + row[0][:10] if row else 'no'}")
 
     row = conn.execute(
-        "SELECT n_tokens, n_chunks, embedded_at FROM fulltext_embeddings WHERE zotero_key = ?",
+        "SELECT COUNT(*), COALESCE(SUM(n_tokens), 0), MAX(embedded_at) "
+        "FROM fulltext_chunks WHERE zotero_key = ?",
         (item.key,)
     ).fetchone()
-    if row:
-        typer.echo(f"Full-text embedded:      yes, {row[2][:10]} ({row[0]} tokens, {row[1]} chunk{'s' if row[1] != 1 else ''})")
+    n_chunks, n_tokens, embedded_at = row
+    if n_chunks:
+        typer.echo(
+            f"Full-text embedded:      yes, {embedded_at[:10]} "
+            f"({n_tokens} tokens, {n_chunks} chunk{'s' if n_chunks != 1 else ''})"
+        )
     else:
-        typer.echo("Full-text embedded:      no")
+        legacy = None
+        try:
+            legacy = conn.execute(
+                "SELECT embedded_at FROM fulltext_embeddings WHERE zotero_key = ?", (item.key,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            pass
+        if legacy:
+            typer.echo(
+                "Full-text embedded:      legacy mean-pooled vector (ignored) — "
+                "re-run `litmap sync-fulltext` to upgrade"
+            )
+        else:
+            typer.echo("Full-text embedded:      no")
 
     conn.close()
 
@@ -298,22 +316,48 @@ def sync_cmd(
 def sync_fulltext_cmd(
     collection: Optional[str] = typer.Option(None, "--collection", "-c", help="Scope to a Zotero collection"),
     force: bool = typer.Option(False, "--force", help="Re-embed even already-processed PDFs"),
-    max_tokens: int = typer.Option(3000, "--max-tokens", help="Max tokens per chunk (default 3000; up to 8000)"),
+    chunk_tokens: int = typer.Option(512, "--chunk-tokens", help="Tokens per chunk [default: 512]"),
+    chunk_overlap: int = typer.Option(64, "--chunk-overlap", help="Token overlap between consecutive chunks [default: 64]"),
+    max_tokens: Optional[int] = typer.Option(None, "--max-tokens", hidden=True, help="Deprecated alias for --chunk-tokens"),
     db_path: Path = typer.Option(_DEFAULT_DB, hidden=True),
     zotero_db: Path = typer.Option(_DEFAULT_ZOTERO, hidden=True),
 ):
     """Embed full PDF text for Zotero items with a local PDF attachment.
 
-    Vectors are stored in the fulltext_embeddings table and automatically
-    preferred over title+abstract embeddings in search, map, and cluster.
+    Each PDF is stored as overlapping chunks. Search scores a paper by its best
+    chunk, so a relevant section is found even in a long paper about other things.
     Safe to interrupt and resume — already-embedded papers are skipped.
     Use --collection to process only a subset of your library.
     """
-    from litmap.embedder import sync_fulltext, init_db
-    init_db(db_path)
-    n_embedded, n_no_pdf = sync_fulltext(db_path, zotero_db, force=force, max_tokens=max_tokens, collection=collection)
+    from litmap.embedder import sync_fulltext, ModelMismatchError
+
+    if max_tokens is not None:
+        typer.echo("--max-tokens is deprecated; using it as --chunk-tokens.", err=True)
+        chunk_tokens = max_tokens
+
+    try:
+        report = sync_fulltext(
+            db_path, zotero_db, force=force, chunk_tokens=chunk_tokens,
+            chunk_overlap=chunk_overlap, collection=collection,
+        )
+    except ModelMismatchError as e:
+        _fatal(str(e), code=2)
+    except ValueError as e:
+        _fatal(f"Error: {e}")
+
     scope = f"collection '{collection}'" if collection else "full library"
-    typer.echo(f"Embedded {n_embedded} PDFs from {scope}. ({n_no_pdf} items had no local PDF and were skipped.)")
+    typer.echo(
+        f"Embedded {report.n_embedded} PDFs from {scope}. "
+        f"({report.n_skipped_no_pdf} items had no local PDF and were skipped.)"
+    )
+    if report.failures:
+        typer.echo(
+            f"\n{len(report.failures)} PDFs could not be read and have no full text:",
+            err=True,
+        )
+        for key, reason in report.failures:
+            typer.echo(f"  {key}  {reason}", err=True)
+        typer.echo("Inspect one with: litmap info <key>", err=True)
 
 
 @app.command("cluster")

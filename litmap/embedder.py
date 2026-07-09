@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
 from datetime import datetime, timezone
@@ -16,6 +17,20 @@ DIMS = 768
 _BATCH_SIZE = 32
 # GTE-ModernBERT context window; leave a small margin
 _MAX_TOKENS = 8000
+
+# Full-text chunking. Retrieval scores a paper by its BEST chunk, so chunks want
+# to be about the size of one argument -- a few paragraphs -- not one paper.
+DEFAULT_CHUNK_TOKENS = 512
+DEFAULT_CHUNK_OVERLAP = 64
+# Chunks are encoded in small batches. Attention cost is quadratic *within* a
+# sequence, so 8 x 512 tokens is far lighter than the single 8000-token encode
+# this replaced. Set to 1 to restore strict one-at-a-time behaviour if an MPS
+# out-of-memory error ever appears.
+_CHUNK_BATCH_SIZE = 8
+
+# Synthetic key for the transient manuscript vector inserted by `litmap map -m`.
+MANUSCRIPT_KEY = "__manuscript__"
+
 _model = None
 _tokenizer = None
 
@@ -72,18 +87,22 @@ def init_db(db_path: Path = EMBEDDINGS_DB, *, expect_model: bool = True) -> None
             vector      BLOB NOT NULL,
             embedded_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS fulltext_embeddings (
-            zotero_key  TEXT PRIMARY KEY,
-            vector      BLOB NOT NULL,
-            embedded_at TEXT NOT NULL,
-            n_tokens    INTEGER,
-            n_chunks    INTEGER
+        CREATE TABLE IF NOT EXISTS fulltext_chunks (
+            zotero_key  TEXT    NOT NULL,
+            chunk_idx   INTEGER NOT NULL,
+            vector      BLOB    NOT NULL,
+            n_tokens    INTEGER NOT NULL,
+            embedded_at TEXT    NOT NULL,
+            PRIMARY KEY (zotero_key, chunk_idx)
         );
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
     """)
+    # `fulltext_embeddings` (one mean-pooled vector per paper) is retired: never
+    # created, never written, never read. Existing databases keep the table --
+    # dropping it is the user's call -- but it no longer affects any result.
     stored = conn.execute("SELECT value FROM meta WHERE key = 'model'").fetchone()
     if stored is None:
         conn.execute("INSERT INTO meta VALUES ('model', ?)", (MODEL_NAME,))
@@ -168,11 +187,11 @@ def _stored_model(db_path: Path) -> Optional[str]:
 def _purge_fulltext(db_path: Path) -> None:
     """Drop full-text vectors left over from a previous embedding model."""
     conn = sqlite3.connect(db_path)
-    for table in ("fulltext_embeddings",):
+    for table in ("fulltext_chunks", "fulltext_embeddings"):
         try:
             conn.execute(f"DELETE FROM {table}")
         except sqlite3.OperationalError:
-            pass  # table absent on databases that never ran sync-fulltext
+            pass  # legacy table absent on databases created after it was retired
     conn.commit()
     conn.close()
 
@@ -235,167 +254,236 @@ def _embed_and_store(items: list[Item], db_path: Path) -> None:
 # Full-text PDF embedding
 # ---------------------------------------------------------------------------
 
-def _extract_pdf_text(pdf_path: Path) -> str:
-    """Extract plain text from a PDF using PyMuPDF. Returns empty string on failure."""
+def _extract_pdf_text(pdf_path: Path) -> tuple[str, Optional[str]]:
+    """Extract plain text from a PDF using PyMuPDF.
+
+    Returns (text, error). Failures used to be swallowed and returned as "",
+    which made an unreadable PDF indistinguishable from one with no text -- so
+    papers silently never got embedded and nothing said so.
+    """
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(str(pdf_path))
         pages = [page.get_text() for page in doc]
         doc.close()
-        return "\n".join(pages)
-    except Exception:
-        return ""
+        return "\n".join(pages), None
+    except Exception as e:
+        return "", f"{type(e).__name__}: {e}"[:200]
 
 
-def _truncate_to_tokens(text: str, max_tokens: int = _MAX_TOKENS) -> tuple[str, int]:
-    """Truncate text to at most max_tokens tokens. Returns (truncated_text, n_tokens)."""
-    tokenizer = _get_tokenizer()
-    tokens = tokenizer.encode(text, add_special_tokens=False)
-    n_tokens = len(tokens)
-    if n_tokens <= max_tokens:
-        return text, n_tokens
-    truncated_ids = tokens[:max_tokens]
-    truncated_text = tokenizer.decode(truncated_ids, skip_special_tokens=True)
-    return truncated_text, max_tokens
+def _chunk_spans(n_tokens: int, chunk_tokens: int, chunk_overlap: int) -> list[tuple[int, int]]:
+    """Half-open [start, end) token spans of an overlapping sliding window.
+
+    A trailing window that would contain nothing but overlap is dropped, so a
+    document of exactly chunk_tokens yields one chunk rather than two.
+    """
+    if chunk_tokens <= 0:
+        raise ValueError("chunk_tokens must be positive")
+    if not 0 <= chunk_overlap < chunk_tokens:
+        raise ValueError(
+            f"chunk_overlap ({chunk_overlap}) must be >= 0 and < chunk_tokens ({chunk_tokens})"
+        )
+    if n_tokens <= 0:
+        return []
+    stride = chunk_tokens - chunk_overlap
+    starts = [
+        s for s in range(0, n_tokens, stride)
+        if s == 0 or s + chunk_overlap < n_tokens
+    ]
+    return [(s, min(s + chunk_tokens, n_tokens)) for s in starts]
 
 
-def _embed_fulltext_single(item: Item, max_tokens: int = _MAX_TOKENS) -> Optional[tuple[np.ndarray, int, int]]:
-    """Extract, chunk, embed and average a single paper's full text.
+def _embed_fulltext_chunks(
+    item: Item,
+    chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> tuple[Optional[list[tuple[np.ndarray, int]]], Optional[str]]:
+    """Embed one paper's PDF as a list of (unit vector, n_tokens) chunks.
 
-    Strategy: split into non-overlapping chunks of max_tokens tokens,
-    embed each chunk, then return the L2-normalised mean vector.
-    Returns (vector, n_tokens, n_chunks) or None if no text extracted.
+    Returns (None, None) when the item has no local PDF, and (None, reason) when
+    text could not be extracted.
     """
     if item.pdf_path is None:
-        return None
-    raw_text = _extract_pdf_text(item.pdf_path)
+        return None, None
+    raw_text, err = _extract_pdf_text(item.pdf_path)
+    if err:
+        return None, err
     if not raw_text.strip():
-        return None
+        return None, "no extractable text (scanned PDF?)"
 
     tokenizer = _get_tokenizer()
-    model = _get_model()
-
     all_tokens = tokenizer.encode(raw_text, add_special_tokens=False)
-    n_tokens = len(all_tokens)
-    if n_tokens == 0:
-        return None
+    if not all_tokens:
+        return None, "no extractable text (scanned PDF?)"
 
-    # Split into chunks
-    chunk_ids = [
-        all_tokens[start:start + max_tokens]
-        for start in range(0, n_tokens, max_tokens)
+    spans = _chunk_spans(len(all_tokens), chunk_tokens, chunk_overlap)
+    texts = [
+        tokenizer.decode(all_tokens[start:end], skip_special_tokens=True)
+        for start, end in spans
     ]
-    chunk_texts = [
-        tokenizer.decode(chunk, skip_special_tokens=True)
-        for chunk in chunk_ids
-    ]
-    n_chunks = len(chunk_texts)
 
-    # Encode one chunk at a time to avoid OOM on MPS with long documents
-    chunk_vecs = []
-    for chunk_text in chunk_texts:
-        vec = model.encode([chunk_text], normalize_embeddings=True, show_progress_bar=False)
-        chunk_vecs.append(vec[0])
-    vecs = np.stack(chunk_vecs)
-    mean_vec = np.mean(vecs, axis=0).astype(np.float32)
-    norm = np.linalg.norm(mean_vec)
-    if norm > 0:
-        mean_vec = mean_vec / norm
+    model = _get_model()
+    vectors: list[np.ndarray] = []
+    for batch_start in range(0, len(texts), _CHUNK_BATCH_SIZE):
+        batch = texts[batch_start:batch_start + _CHUNK_BATCH_SIZE]
+        encoded = model.encode(batch, normalize_embeddings=True, show_progress_bar=False)
+        vectors.extend(np.asarray(v, dtype=np.float32) for v in encoded)
 
-    return mean_vec, n_tokens, n_chunks
+    return [(v, end - start) for v, (start, end) in zip(vectors, spans)], None
 
 
-def _existing_fulltext_keys(db_path: Path) -> set[str]:
+def _existing_chunk_keys(db_path: Path) -> set[str]:
     conn = sqlite3.connect(db_path)
-    rows = conn.execute("SELECT zotero_key FROM fulltext_embeddings").fetchall()
-    conn.close()
+    try:
+        rows = conn.execute("SELECT DISTINCT zotero_key FROM fulltext_chunks").fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
     return {r[0] for r in rows}
+
+
+def load_chunk_vectors(
+    db_path: Path = EMBEDDINGS_DB,
+    scope_keys: Optional[list[str]] = None,
+) -> tuple[np.ndarray, list[str]]:
+    """All full-text chunk vectors, one matrix row per CHUNK.
+
+    Returns (matrix, owners) where owners[i] is the zotero_key that row i belongs to.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        if scope_keys is not None:
+            if not scope_keys:
+                return np.empty((0, DIMS), dtype=np.float32), []
+            placeholders = ",".join("?" * len(scope_keys))
+            rows = conn.execute(
+                f"SELECT zotero_key, vector FROM fulltext_chunks "
+                f"WHERE zotero_key IN ({placeholders}) ORDER BY zotero_key, chunk_idx",
+                scope_keys,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT zotero_key, vector FROM fulltext_chunks ORDER BY zotero_key, chunk_idx"
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return np.empty((0, DIMS), dtype=np.float32), []
+    finally:
+        conn.close()
+    if not rows:
+        return np.empty((0, DIMS), dtype=np.float32), []
+    owners = [r[0] for r in rows]
+    matrix = np.stack([np.frombuffer(r[1], dtype=np.float32) for r in rows])
+    return matrix, owners
+
+
+def _mean_chunk_vectors(matrix: np.ndarray, owners: list[str]) -> dict[str, np.ndarray]:
+    """One L2-normalised mean vector per paper, from its chunk vectors."""
+    sums: dict[str, np.ndarray] = {}
+    counts: dict[str, int] = {}
+    for owner, vec in zip(owners, matrix):
+        if owner in sums:
+            sums[owner] += vec
+            counts[owner] += 1
+        else:
+            sums[owner] = vec.astype(np.float64).copy()
+            counts[owner] = 1
+    means = {}
+    for owner, total in sums.items():
+        mean = total / counts[owner]
+        norm = np.linalg.norm(mean)
+        if norm > 0:
+            mean = mean / norm
+        means[owner] = mean.astype(np.float32)
+    return means
 
 
 def load_all_fulltext_embeddings(
     db_path: Path = EMBEDDINGS_DB,
     scope_keys: Optional[list[str]] = None,
 ) -> tuple[np.ndarray, list[str]]:
-    """Load full-text embeddings (falls back to title+abstract embeddings if absent)."""
-    conn = sqlite3.connect(db_path)
-    if scope_keys:
-        placeholders = ",".join("?" * len(scope_keys))
-        # Prefer fulltext; fall back to title+abstract
-        rows = conn.execute(
-            f"""
-            SELECT COALESCE(ft.zotero_key, e.zotero_key) AS zotero_key,
-                   COALESCE(ft.vector, e.vector) AS vector
-            FROM embeddings e
-            LEFT JOIN fulltext_embeddings ft ON ft.zotero_key = e.zotero_key
-            WHERE e.zotero_key IN ({placeholders})
-            """,
-            scope_keys,
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT COALESCE(ft.zotero_key, e.zotero_key) AS zotero_key,
-                   COALESCE(ft.vector, e.vector) AS vector
-            FROM embeddings e
-            LEFT JOIN fulltext_embeddings ft ON ft.zotero_key = e.zotero_key
-            """
-        ).fetchall()
-    conn.close()
-    if not rows:
-        return np.empty((0, DIMS), dtype=np.float32), []
-    keys = [r[0] for r in rows]
-    matrix = np.stack([np.frombuffer(r[1], dtype=np.float32) for r in rows])
-    return matrix, keys
+    """One vector per paper: the mean of its full-text chunks, else title+abstract.
+
+    Used by `map` and `cluster`, where each paper must be a single point. Search
+    does NOT use this -- it scores papers by their best chunk (see find_similar).
+    """
+    ta_matrix, ta_keys = load_all_embeddings(db_path, scope_keys)
+    if not ta_keys:
+        return ta_matrix, ta_keys
+    chunk_matrix, owners = load_chunk_vectors(db_path, scope_keys)
+    if not owners:
+        return ta_matrix, ta_keys
+    means = _mean_chunk_vectors(chunk_matrix, owners)
+    matrix = np.stack([means.get(k, v) for k, v in zip(ta_keys, ta_matrix)])
+    return matrix, ta_keys
+
+
+@dataclass
+class FulltextSyncReport:
+    n_embedded: int = 0
+    n_skipped_no_pdf: int = 0
+    # (zotero_key, reason) -- opaque keys only, never titles
+    failures: list[tuple[str, str]] = field(default_factory=list)
 
 
 def sync_fulltext(
     db_path: Path = EMBEDDINGS_DB,
     zotero_db: Path = ZOTERO_DB,
     force: bool = False,
-    max_tokens: int = _MAX_TOKENS,
+    chunk_tokens: int = DEFAULT_CHUNK_TOKENS,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     collection: Optional[str] = None,
-) -> tuple[int, int]:
-    """Embed full PDF text for Zotero items that have a local PDF.
+) -> FulltextSyncReport:
+    """Embed each local PDF as overlapping chunks in the fulltext_chunks table.
 
-    If collection is given, only items in that collection are processed.
-    Skips items already in fulltext_embeddings unless force=True.
-    Returns (n_embedded, n_skipped_no_pdf).
+    One transaction per paper, so an interrupted run resumes where it stopped and
+    a re-run replaces a paper's chunks wholesale (no stale trailing chunk_idx).
+    Papers already chunked are skipped unless force=True.
     """
     init_db(db_path)
+    # Validate the window before doing hours of work.
+    _chunk_spans(1, chunk_tokens, chunk_overlap)
+
     if collection:
         from litmap.zotero import get_collection
         all_items = get_collection(collection, zotero_db)
     else:
         all_items = get_all_items(zotero_db)
+
     items_with_pdf = [i for i in all_items if i.pdf_path is not None]
-    n_skipped_no_pdf = len(all_items) - len(items_with_pdf)
+    report = FulltextSyncReport(n_skipped_no_pdf=len(all_items) - len(items_with_pdf))
 
     if not force:
-        existing = _existing_fulltext_keys(db_path)
+        existing = _existing_chunk_keys(db_path)
         items_with_pdf = [i for i in items_with_pdf if i.key not in existing]
-
     if not items_with_pdf:
-        return 0, n_skipped_no_pdf
+        return report
 
     conn = sqlite3.connect(db_path)
-    now = datetime.now(timezone.utc).isoformat()
-    n_embedded = 0
-
     with tqdm(total=len(items_with_pdf), desc="Embedding full-text PDFs", unit="paper") as bar:
         for item in items_with_pdf:
             bar.set_postfix({"file": item.pdf_path.name[:40] if item.pdf_path else ""})
-            result = _embed_fulltext_single(item, max_tokens=max_tokens)
-            if result is not None:
-                vec, n_tokens, n_chunks = result
-                conn.execute(
-                    """INSERT OR REPLACE INTO fulltext_embeddings
-                       (zotero_key, vector, embedded_at, n_tokens, n_chunks)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (item.key, vec.tobytes(), now, n_tokens, n_chunks),
+            try:
+                chunks, err = _embed_fulltext_chunks(item, chunk_tokens, chunk_overlap)
+            except Exception as e:  # a single bad PDF must not end the run
+                chunks, err = None, f"{type(e).__name__}: {e}"[:200]
+
+            if chunks:
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute("DELETE FROM fulltext_chunks WHERE zotero_key = ?", (item.key,))
+                conn.executemany(
+                    "INSERT INTO fulltext_chunks "
+                    "(zotero_key, chunk_idx, vector, n_tokens, embedded_at) VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (item.key, idx, vec.tobytes(), n_tokens, now)
+                        for idx, (vec, n_tokens) in enumerate(chunks)
+                    ],
                 )
                 conn.commit()
-                n_embedded += 1
+                report.n_embedded += 1
+            elif err:
+                report.failures.append((item.key, err))
             bar.update(1)
 
     conn.close()
-    return n_embedded, n_skipped_no_pdf
+    return report

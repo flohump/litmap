@@ -222,6 +222,14 @@ def embeddings_db(tmp_path):
             n_tokens    INTEGER,
             n_chunks    INTEGER
         );
+        CREATE TABLE fulltext_chunks (
+            zotero_key  TEXT    NOT NULL,
+            chunk_idx   INTEGER NOT NULL,
+            vector      BLOB    NOT NULL,
+            n_tokens    INTEGER NOT NULL,
+            embedded_at TEXT    NOT NULL,
+            PRIMARY KEY (zotero_key, chunk_idx)
+        );
         CREATE TABLE meta (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
