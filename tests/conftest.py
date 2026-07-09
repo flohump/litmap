@@ -107,6 +107,98 @@ def zotero_db(tmp_path):
     return db_path
 
 
+@pytest.fixture
+def zotero_db_authors(tmp_path):
+    """Zotero DB exercising two author-fidelity traps.
+
+    MULTI001: creators inserted with DECREASING orderIndex, so any query that
+      relies on insertion/rowid order yields the last author first.
+      Correct authorship order: Muller-Karger (0), Apple (1), Zhao (2).
+    INST001: a single-field (institutional) creator with no firstName. Zotero
+      stores organisations this way. `lastName || ', ' || firstName` evaluates
+      to NULL for such a row, and GROUP_CONCAT skips NULLs, so the author
+      vanishes entirely.
+    """
+    db_path = tmp_path / "zotero_authors.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE itemTypes (itemTypeID INTEGER PRIMARY KEY, typeName TEXT);
+        INSERT INTO itemTypes VALUES (2, 'journalArticle');
+        INSERT INTO itemTypes VALUES (14, 'attachment');
+        INSERT INTO itemTypes VALUES (26, 'note');
+
+        CREATE TABLE fields (fieldID INTEGER PRIMARY KEY, fieldName TEXT);
+        INSERT INTO fields VALUES (1, 'title');
+        INSERT INTO fields VALUES (2, 'abstractNote');
+        INSERT INTO fields VALUES (6, 'date');
+        INSERT INTO fields VALUES (8, 'DOI');
+
+        CREATE TABLE creatorTypes (creatorTypeID INTEGER PRIMARY KEY, creatorType TEXT);
+        INSERT INTO creatorTypes VALUES (1, 'author');
+        INSERT INTO creatorTypes VALUES (3, 'editor');
+
+        CREATE TABLE items (
+            itemID INTEGER PRIMARY KEY, itemTypeID INTEGER,
+            libraryID INTEGER DEFAULT 1, key TEXT
+        );
+        INSERT INTO items VALUES (1, 2, 1, 'MULTI001');
+        INSERT INTO items VALUES (2, 2, 1, 'INST001');
+
+        CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
+        INSERT INTO itemDataValues VALUES (1, 'Ordered Authors Paper');
+        INSERT INTO itemDataValues VALUES (2, 'Abstract one');
+        INSERT INTO itemDataValues VALUES (3, '2018');
+        INSERT INTO itemDataValues VALUES (4, '10.9999/multi');
+        INSERT INTO itemDataValues VALUES (5, 'Institutional Report');
+        INSERT INTO itemDataValues VALUES (6, 'Abstract two');
+        INSERT INTO itemDataValues VALUES (7, '2020');
+        INSERT INTO itemDataValues VALUES (8, '10.9999/inst');
+
+        CREATE TABLE itemData (itemID INTEGER, fieldID INTEGER, valueID INTEGER);
+        INSERT INTO itemData VALUES (1, 1, 1);
+        INSERT INTO itemData VALUES (1, 2, 2);
+        INSERT INTO itemData VALUES (1, 6, 3);
+        INSERT INTO itemData VALUES (1, 8, 4);
+        INSERT INTO itemData VALUES (2, 1, 5);
+        INSERT INTO itemData VALUES (2, 2, 6);
+        INSERT INTO itemData VALUES (2, 6, 7);
+        INSERT INTO itemData VALUES (2, 8, 8);
+
+        -- Highest creatorID is the FIRST author; insertion order is reversed.
+        CREATE TABLE creators (creatorID INTEGER PRIMARY KEY, firstName TEXT, lastName TEXT);
+        INSERT INTO creators VALUES (10, 'Xavier', 'Zhao');
+        INSERT INTO creators VALUES (11, 'Alice', 'Apple');
+        INSERT INTO creators VALUES (12, 'Frank E.', 'Muller-Karger');
+        INSERT INTO creators VALUES (20, NULL, 'Global Science Council');
+        INSERT INTO creators VALUES (21, 'Rita', 'Editor');
+
+        CREATE TABLE itemCreators (
+            itemID INTEGER, creatorID INTEGER, creatorTypeID INTEGER, orderIndex INTEGER
+        );
+        INSERT INTO itemCreators VALUES (1, 10, 1, 2);
+        INSERT INTO itemCreators VALUES (1, 11, 1, 1);
+        INSERT INTO itemCreators VALUES (1, 12, 1, 0);
+        INSERT INTO itemCreators VALUES (2, 20, 1, 0);
+        INSERT INTO itemCreators VALUES (2, 21, 3, 0);
+
+        CREATE TABLE collections (
+            collectionID INTEGER PRIMARY KEY, collectionName TEXT,
+            parentCollectionID INTEGER, libraryID INTEGER DEFAULT 1
+        );
+        CREATE TABLE collectionItems (collectionID INTEGER, itemID INTEGER);
+        CREATE TABLE itemAttachments (
+            itemID       INTEGER PRIMARY KEY,
+            parentItemID INTEGER,
+            linkMode     INTEGER,
+            contentType  TEXT,
+            path         TEXT
+        );
+    """)
+    conn.commit()
+    conn.close()
+    return db_path
+
+
 import numpy as np
 
 

@@ -4,10 +4,12 @@ import sqlite3
 from typing import Optional
 
 ZOTERO_DB = Path.home() / "Zotero" / "zotero.sqlite"
-# Zotero itemTypeIDs we exclude from all paper-level queries:
-# 14 = attachment, 26 = note. Neither represents a citable paper.
-EXCLUDED_TYPES = (14, 26)
-_EXCLUDED_TYPES_SQL = "(" + ",".join(str(t) for t in EXCLUDED_TYPES) + ")"
+# Item types excluded from all paper-level queries: neither is a citable paper.
+# Resolved by name at runtime -- Zotero's numeric IDs are an internal detail and
+# were renumbered wholesale in Zotero 9.
+EXCLUDED_TYPE_NAMES = ("attachment", "note")
+# Only used if the itemTypes table cannot be read (values as of Zotero 7-9).
+_EXCLUDED_TYPES_FALLBACK = (14, 26)
 
 
 @dataclass
@@ -43,10 +45,76 @@ def _author_type_id(conn: sqlite3.Connection) -> int:
     return row["creatorTypeID"] if row else 1
 
 
-def _rows_to_items(rows, zotero_base: Optional[Path] = None) -> list[Item]:
+def _excluded_type_ids(conn: sqlite3.Connection) -> tuple[int, ...]:
+    placeholders = ",".join("?" * len(EXCLUDED_TYPE_NAMES))
+    try:
+        rows = conn.execute(
+            f"SELECT itemTypeID FROM itemTypes WHERE typeName IN ({placeholders})",
+            EXCLUDED_TYPE_NAMES,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return _EXCLUDED_TYPES_FALLBACK
+    ids = tuple(r["itemTypeID"] for r in rows)
+    return ids or _EXCLUDED_TYPES_FALLBACK
+
+
+def _format_author(last: Optional[str], first: Optional[str]) -> str:
+    """Render one creator as "Last, First".
+
+    Institutional creators carry only a lastName. Concatenating them in SQL
+    (`lastName || ', ' || firstName`) yields NULL, and GROUP_CONCAT drops NULLs,
+    which silently erased organisation authors -- hence the formatting lives here.
+    """
+    last = (last or "").strip()
+    first = (first or "").strip()
+    if last and first:
+        return f"{last}, {first}"
+    return last or first
+
+
+def _authors_by_item(
+    conn: sqlite3.Connection,
+    author_type: int,
+    item_ids: Optional[list[int]] = None,
+) -> dict[int, list[str]]:
+    """Map itemID -> authors in authorship order.
+
+    Ordering is applied in Python rather than with `GROUP_CONCAT(... ORDER BY ...)`,
+    which is a syntax error before SQLite 3.44 (the interpreter shipping this
+    package links 3.42). Passing item_ids=None reads every creator row, which
+    avoids an IN-clause wider than SQLITE_MAX_VARIABLE_NUMBER on a large library.
+    """
+    sql = """
+        SELECT ic.itemID AS item_id, c.lastName AS last_name, c.firstName AS first_name
+        FROM itemCreators ic
+        JOIN creators c ON c.creatorID = ic.creatorID
+        WHERE ic.creatorTypeID = ?
+    """
+    params: list = [author_type]
+    if item_ids is not None:
+        if not item_ids:
+            return {}
+        sql += f" AND ic.itemID IN ({','.join('?' * len(item_ids))})"
+        params.extend(item_ids)
+    sql += " ORDER BY ic.itemID, ic.orderIndex"
+
+    out: dict[int, list[str]] = {}
+    for r in conn.execute(sql, params).fetchall():
+        name = _format_author(r["last_name"], r["first_name"])
+        if name:
+            out.setdefault(r["item_id"], []).append(name)
+    return out
+
+
+def _rows_to_items(
+    rows,
+    zotero_base: Optional[Path] = None,
+    authors_by_id: Optional[dict[int, list[str]]] = None,
+) -> list[Item]:
+    authors_by_id = authors_by_id or {}
     items = []
     for r in rows:
-        authors = [a.strip() for a in (r["authors"] or "").split(";") if a.strip()]
+        authors = list(authors_by_id.get(dict(r).get("item_id"), []))
         # Resolve PDF path from storage:filename pattern
         pdf_path: Optional[Path] = None
         raw_path = dict(r).get("pdf_path") or ""
@@ -72,12 +140,20 @@ def _rows_to_items(rows, zotero_base: Optional[Path] = None) -> list[Item]:
     return items
 
 
-_ITEM_SELECT = """
+def _item_select(excluded_ids: tuple[int, ...]) -> str:
+    """Paper-level SELECT. Creators are NOT joined here.
+
+    Joining itemCreators multiplied every item row by its author count and forced
+    a GROUP BY whose GROUP_CONCAT had no defined output order. Authors are fetched
+    separately by _authors_by_item and attached in Python.
+    """
+    excluded_sql = "(" + ",".join(str(int(t)) for t in excluded_ids) + ")"
+    return """
     SELECT
+        i.itemID  AS item_id,
         i.key,
         tv.value  AS title,
         av.value  AS abstract,
-        GROUP_CONCAT(c.lastName || ', ' || c.firstName, '; ') AS authors,
         dv.value  AS year,
         doiv.value AS doi,
         kv.value  AS keywords,
@@ -94,8 +170,6 @@ _ITEM_SELECT = """
     LEFT JOIN itemDataValues doiv ON doiv.valueID = doid.valueID
     LEFT JOIN itemData    kd   ON kd.itemID   = i.itemID AND kd.fieldID   = :keywords_id
     LEFT JOIN itemDataValues kv ON kv.valueID = kd.valueID
-    LEFT JOIN itemCreators ic ON ic.itemID = i.itemID AND ic.creatorTypeID = :author_type
-    LEFT JOIN creators c ON c.creatorID = ic.creatorID
     LEFT JOIN (
         SELECT parentItemID, MIN(itemID) AS itemID, path
         FROM itemAttachments
@@ -103,9 +177,17 @@ _ITEM_SELECT = """
         GROUP BY parentItemID
     ) att ON att.parentItemID = i.itemID
     LEFT JOIN items atti ON atti.itemID = att.itemID
-    WHERE i.itemTypeID NOT IN """ + _EXCLUDED_TYPES_SQL + """
+    WHERE i.itemTypeID NOT IN """ + excluded_sql + """
       AND tv.value IS NOT NULL
 """
+
+
+def _field_params(fids: dict[str, int]) -> dict:
+    return {
+        "title_id": fids["title"], "abs_id": fids["abstractNote"],
+        "date_id": fids["date"], "doi_id": fids["DOI"],
+        "keywords_id": fids.get("keywords"),
+    }
 
 
 def get_all_items(db_path: Path = ZOTERO_DB) -> list[Item]:
@@ -114,13 +196,12 @@ def get_all_items(db_path: Path = ZOTERO_DB) -> list[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _ITEM_SELECT + " GROUP BY i.itemID",
-            {"title_id": fids["title"], "abs_id": fids["abstractNote"],
-             "date_id": fids["date"], "doi_id": fids["DOI"],
-             "keywords_id": fids.get("keywords"),
-             "author_type": atid},
+            _item_select(_excluded_type_ids(conn)),
+            _field_params(fids),
         ).fetchall()
-    return _rows_to_items(rows, zotero_base)
+        # item_ids=None: read every creator row rather than build a 16k-wide IN clause
+        authors = _authors_by_item(conn, atid)
+    return _rows_to_items(rows, zotero_base, authors)
 
 
 def get_collection(name: str, db_path: Path = ZOTERO_DB) -> list[Item]:
@@ -129,20 +210,17 @@ def get_collection(name: str, db_path: Path = ZOTERO_DB) -> list[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _ITEM_SELECT + """
+            _item_select(_excluded_type_ids(conn)) + """
               AND i.itemID IN (
                   SELECT ci.itemID FROM collectionItems ci
                   JOIN collections col ON col.collectionID = ci.collectionID
                   WHERE col.collectionName = :name
               )
-            GROUP BY i.itemID
             """,
-            {"title_id": fids["title"], "abs_id": fids["abstractNote"],
-             "date_id": fids["date"], "doi_id": fids["DOI"],
-             "keywords_id": fids.get("keywords"),
-             "author_type": atid, "name": name},
+            {**_field_params(fids), "name": name},
         ).fetchall()
-    return _rows_to_items(rows, zotero_base)
+        authors = _authors_by_item(conn, atid, [r["item_id"] for r in rows])
+    return _rows_to_items(rows, zotero_base, authors)
 
 
 def get_item(key_or_doi: str, db_path: Path = ZOTERO_DB) -> Optional[Item]:
@@ -151,17 +229,14 @@ def get_item(key_or_doi: str, db_path: Path = ZOTERO_DB) -> Optional[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _ITEM_SELECT + """
+            _item_select(_excluded_type_ids(conn)) + """
               AND (i.key = :val OR doiv.value = :val)
-            GROUP BY i.itemID
             LIMIT 1
             """,
-            {"title_id": fids["title"], "abs_id": fids["abstractNote"],
-             "date_id": fids["date"], "doi_id": fids["DOI"],
-             "keywords_id": fids.get("keywords"),
-             "author_type": atid, "val": key_or_doi},
+            {**_field_params(fids), "val": key_or_doi},
         ).fetchall()
-    items = _rows_to_items(rows, zotero_base)
+        authors = _authors_by_item(conn, atid, [r["item_id"] for r in rows])
+    items = _rows_to_items(rows, zotero_base, authors)
     return items[0] if items else None
 
 
@@ -172,13 +247,14 @@ def get_subcollection_map(db_path: Path = ZOTERO_DB) -> dict[str, list[str]]:
     a child collection are not included by inheritance.
     """
     with _connect(db_path) as conn:
+        excluded_sql = "(" + ",".join(str(int(t)) for t in _excluded_type_ids(conn)) + ")"
         rows = conn.execute(
             """
             SELECT i.key AS key, col.collectionName AS name
             FROM items i
             JOIN collectionItems ci ON ci.itemID = i.itemID
             JOIN collections col ON col.collectionID = ci.collectionID
-            WHERE i.itemTypeID NOT IN """ + _EXCLUDED_TYPES_SQL + """
+            WHERE i.itemTypeID NOT IN """ + excluded_sql + """
             ORDER BY i.key, col.collectionName
             """
         ).fetchall()
