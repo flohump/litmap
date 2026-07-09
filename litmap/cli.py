@@ -12,9 +12,18 @@ _DEFAULT_DB    = Path.home() / "LitLake" / "embeddings.db"
 _DEFAULT_ZOTERO = Path.home() / "Zotero" / "zotero.sqlite"
 
 
+def _fatal(message: str, code: int = 1) -> None:
+    """Report a user-actionable failure without a traceback."""
+    typer.echo(message, err=True)
+    raise typer.Exit(code)
+
+
 def _auto_sync(db_path: Path, zotero_db: Path) -> None:
-    from litmap.embedder import sync
-    sync(db_path, zotero_db)
+    from litmap.embedder import sync, ModelMismatchError
+    try:
+        sync(db_path, zotero_db)
+    except ModelMismatchError as e:
+        _fatal(str(e), code=2)
 
 
 @app.command("map")
@@ -274,8 +283,11 @@ def sync_cmd(
     zotero_db: Path = typer.Option(_DEFAULT_ZOTERO, hidden=True),
 ):
     """Sync Zotero items into embeddings DB. Use --force to regenerate all embeddings."""
-    from litmap.embedder import sync
-    count = sync(db_path, zotero_db, force=force)
+    from litmap.embedder import sync, ModelMismatchError
+    try:
+        count = sync(db_path, zotero_db, force=force)
+    except ModelMismatchError as e:
+        _fatal(str(e), code=2)
     if count == 0:
         typer.echo("Already up to date.")
     else:

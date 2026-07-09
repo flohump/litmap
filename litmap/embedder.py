@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 from pathlib import Path
 import sqlite3
 from datetime import datetime, timezone
@@ -19,11 +20,31 @@ _model = None
 _tokenizer = None
 
 
+class ModelMismatchError(RuntimeError):
+    """embeddings.db holds vectors from a different embedding model."""
+
+
+def _detect_device() -> str:
+    """Pick a torch device. LITMAP_DEVICE overrides; otherwise mps > cuda > cpu."""
+    override = os.environ.get("LITMAP_DEVICE")
+    if override:
+        return override
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def _get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(MODEL_NAME, device="mps")
+        _model = SentenceTransformer(MODEL_NAME, device=_detect_device())
     return _model
 
 
@@ -35,7 +56,14 @@ def _get_tokenizer():
     return _tokenizer
 
 
-def init_db(db_path: Path = EMBEDDINGS_DB) -> None:
+def init_db(db_path: Path = EMBEDDINGS_DB, *, expect_model: bool = True) -> None:
+    """Create the schema and verify the database's embedding model.
+
+    Raises ModelMismatchError when the stored model differs from MODEL_NAME:
+    vectors from two models share no coordinate system, so similarity across
+    them is meaningless. Pass expect_model=False only when about to re-embed
+    everything (sync --force), which then adopts the new model.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript("""
@@ -56,8 +84,31 @@ def init_db(db_path: Path = EMBEDDINGS_DB) -> None:
             value TEXT NOT NULL
         );
     """)
-    conn.execute("INSERT OR IGNORE INTO meta VALUES ('model', ?)", (MODEL_NAME,))
-    conn.execute("INSERT OR IGNORE INTO meta VALUES ('dims', ?)", (str(DIMS),))
+    stored = conn.execute("SELECT value FROM meta WHERE key = 'model'").fetchone()
+    if stored is None:
+        conn.execute("INSERT INTO meta VALUES ('model', ?)", (MODEL_NAME,))
+        conn.execute("INSERT INTO meta VALUES ('dims', ?)", (str(DIMS),))
+    elif stored[0] != MODEL_NAME and expect_model:
+        conn.close()
+        raise ModelMismatchError(
+            f"{db_path} was built with embedding model '{stored[0]}', "
+            f"but litmap now uses '{MODEL_NAME}'. The stored vectors are not "
+            f"comparable to new ones. Run 'litmap sync --force' to re-embed the "
+            f"library with the current model."
+        )
+    conn.commit()
+    conn.close()
+
+
+def _adopt_model(db_path: Path) -> None:
+    """Record the current model and drop vectors built with the previous one."""
+    conn = sqlite3.connect(db_path)
+    for key, value in (("model", MODEL_NAME), ("dims", str(DIMS))):
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
     conn.commit()
     conn.close()
 
@@ -100,12 +151,42 @@ def load_all_embeddings(
     return matrix, keys
 
 
+def _stored_model(db_path: Path) -> Optional[str]:
+    """The model name recorded in an existing DB, or None if unknown."""
+    if not Path(db_path).exists():
+        return None
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'model'").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+def _purge_fulltext(db_path: Path) -> None:
+    """Drop full-text vectors left over from a previous embedding model."""
+    conn = sqlite3.connect(db_path)
+    for table in ("fulltext_embeddings",):
+        try:
+            conn.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError:
+            pass  # table absent on databases that never ran sync-fulltext
+    conn.commit()
+    conn.close()
+
+
 def sync(
     db_path: Path = EMBEDDINGS_DB,
     zotero_db: Path = ZOTERO_DB,
     force: bool = False,
 ) -> int:
-    init_db(db_path)
+    previous_model = _stored_model(db_path)
+    # A mismatch is fatal unless we are about to re-embed everything anyway.
+    init_db(db_path, expect_model=not force)
+    model_changed = bool(previous_model) and previous_model != MODEL_NAME
+
     all_items = get_all_items(zotero_db)
     if force:
         items_to_embed = all_items
@@ -115,6 +196,11 @@ def sync(
     if not items_to_embed:
         return 0
     _embed_and_store(items_to_embed, db_path)
+
+    # Adopt the new model only once every vector has been rewritten under it.
+    if force and model_changed:
+        _adopt_model(db_path)
+        _purge_fulltext(db_path)
     return len(items_to_embed)
 
 
