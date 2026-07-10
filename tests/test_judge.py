@@ -17,7 +17,10 @@ from litmap.cli import app
 from litmap.judge import JudgeError, judge_results
 
 # Keys the zotero + manuscript-audit skills read out of each result.
-SKILL_RESULT_KEYS = {"zotero_key", "title", "authors", "year", "abstract", "similarity", "doi"}
+LEGACY_RESULT_KEYS = {"zotero_key", "title", "authors", "year", "abstract", "similarity", "doi"}
+# full_text says whether the paper was scored on its best chunk or its abstract --
+# the two are not on the same scale, so a caller must be able to tell them apart.
+SKILL_RESULT_KEYS = LEGACY_RESULT_KEYS | {"full_text"}
 
 
 def _reply(scores) -> dict:
@@ -211,6 +214,25 @@ def test_json_contract_without_judge_is_unchanged(cli_db):
     assert set(payload) == {"query", "results"}, "top-level JSON shape is a skill contract"
     for r in payload["results"]:
         assert set(r) == SKILL_RESULT_KEYS
+        assert LEGACY_RESULT_KEYS <= set(r), "a skill-parsed key disappeared"
+        assert isinstance(r["full_text"], bool)
+
+
+def test_full_text_flag_reflects_chunk_presence(cli_db, make_vector_fn):
+    import sqlite3
+    embeddings_db, _ = cli_db
+    conn = sqlite3.connect(embeddings_db)
+    conn.execute(
+        "INSERT INTO fulltext_chunks (zotero_key, chunk_idx, vector, n_tokens, embedded_at) "
+        "VALUES ('AAAA0001', 0, ?, 512, 'x')",
+        (make_vector_fn(0).tobytes(),),
+    )
+    conn.commit(); conn.close()
+
+    payload = json.loads(_run(cli_db).stdout)
+    flags = {r["zotero_key"]: r["full_text"] for r in payload["results"]}
+    assert flags["AAAA0001"] is True
+    assert all(v is False for k, v in flags.items() if k != "AAAA0001")
 
 
 def test_json_with_judge_is_additive_only(cli_db, monkeypatch):

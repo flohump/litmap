@@ -40,6 +40,19 @@ paper's full-text chunks with it. An empty library read never triggers a prune, 
 a failed or misdirected read cannot empty the index. `sync()` returns a
 `SyncReport(n_embedded, n_pruned)`.
 
+### Journal feed items were indexed
+
+A Zotero **feed** is a subscribed journal table-of-contents, not a library you
+curate. Its items arrive automatically, never have attachments, and Zotero deletes
+them again after a few days (`feeds.cleanupReadAfter` / `cleanupUnreadAfter`).
+litmap indexed them anyway, so the index contained papers the user had never chosen
+to save — and permanently chased a rolling window, yesterday's feed items becoming
+today's orphan vectors. On the library that prompted this: 116 items across three
+Nature feeds, and very likely the source of most of the 606 orphans above.
+
+Now excluded via `libraries.type = 'feed'`. Group libraries are **not** excluded —
+they are real shared libraries — and a test guards against that over-exclusion.
+
 ### Trashed papers were indexed
 
 Deleting an item in Zotero only adds a row to `deletedItems`; the item stays in
@@ -47,8 +60,10 @@ Deleting an item in Zotero only adds a row to `deletedItems`; the item stays in
 from `get_all_items`, `get_collection`, `get_item` and `get_subcollection_map`,
 guarded for schemas predating the table.
 
-Together these three accounted for **1,266 of 2,898 rows (44%) of a real index**.
-Every search ranked real papers against them.
+Together these accounted for **1,382 of 2,898 rows (48%) of a real index**: 644
+attachments, 606 orphans, 116 feed items, 16 trashed. Every search ranked real
+papers against them. The library holds 1,607 papers — 320 in My Library and 1,287
+across two group libraries.
 
 ### Authorship order, and vanishing institutional authors
 

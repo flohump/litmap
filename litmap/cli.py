@@ -245,6 +245,13 @@ def search_cmd(
 
     enriched = deduplicate_results(enriched_all, top_k=top_k)
 
+    # A paper scored on its best chunk sits ~0.06 above one scored on title+abstract.
+    # Say which, so a caller does not compare the two as if they were the same scale.
+    from litmap.embedder import chunked_keys
+    has_ft = chunked_keys(db_path, [r["zotero_key"] for r in enriched])
+    for r in enriched:
+        r["full_text"] = r["zotero_key"] in has_ft
+
     judge_meta = None
     if judge:
         from litmap.judge import judge_results, JudgeError

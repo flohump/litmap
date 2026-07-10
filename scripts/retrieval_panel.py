@@ -193,9 +193,32 @@ def validate_queries(queries: dict) -> None:
         raise SystemExit("queries file rejected:\n  " + "\n  ".join(problems))
 
 
+TITLE_ABSTRACT_ONLY = False
+
+
+def _rank_title_abstract(vec: np.ndarray) -> list[dict]:
+    """Rank using only the title+abstract vectors, ignoring fulltext_chunks.
+
+    Reproduces the pre-chunking scorer exactly, so a "before" panel can be re-run
+    on the current index without deleting the chunks.
+    """
+    from litmap.embedder import load_all_embeddings
+    matrix, keys = load_all_embeddings(EMBEDDINGS_DB)
+    if not keys:
+        return []
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    matrix = matrix / np.where(norms == 0, 1e-10, norms)
+    q = vec / max(float(np.linalg.norm(vec)), 1e-10)
+    sims = matrix @ q
+    out = [{"key": k, "similarity": float(s)} for k, s in zip(keys, sims)]
+    out.sort(key=lambda r: (-r["similarity"], r["key"]))
+    return out
+
+
 def rank_of(key: str, query_text: str) -> tuple[int | None, float | None, float]:
     vec = embed_text(query_text)
-    results = find_similar(vec, EMBEDDINGS_DB, top_k=RANK_CEILING)
+    results = (_rank_title_abstract(vec) if TITLE_ABSTRACT_ONLY
+               else find_similar(vec, EMBEDDINGS_DB, top_k=RANK_CEILING))
     top1 = results[0]["similarity"] if results else float("nan")
     for position, r in enumerate(results, start=1):
         if r["key"] == key:
@@ -303,12 +326,17 @@ def main() -> None:
                    help="write the questions with a local model instead of by hand")
     p.add_argument("--n", type=int, default=14, help="papers to sample")
     p.add_argument("--seed", type=int, default=20260710)
+    p.add_argument("--title-abstract-only", action="store_true",
+                   help="ignore fulltext_chunks; reproduces the pre-chunking scorer")
     p.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"))
     args = p.parse_args()
 
     if args.compare:
         compare(*args.compare)
         return
+
+    global TITLE_ABSTRACT_ONLY
+    TITLE_ABSTRACT_ONLY = args.title_abstract_only
 
     if args.extract:
         passages = extract_passages(args.n, args.seed)

@@ -367,6 +367,29 @@ def _embed_fulltext_chunks(
     return [(v, end - start) for v, (start, end) in zip(vectors, spans)], None
 
 
+def chunked_keys(db_path: Path, keys: list[str]) -> set[str]:
+    """Which of `keys` have full-text chunks.
+
+    A paper scored on its best chunk sits systematically higher than one scored on
+    its title and abstract, so a caller comparing two scores needs to know which is
+    which.
+    """
+    if not keys:
+        return set()
+    conn = sqlite3.connect(db_path)
+    try:
+        placeholders = ",".join("?" * len(keys))
+        rows = conn.execute(
+            f"SELECT DISTINCT zotero_key FROM fulltext_chunks WHERE zotero_key IN ({placeholders})",
+            keys,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
+    return {r[0] for r in rows}
+
+
 def _existing_chunk_keys(db_path: Path) -> set[str]:
     conn = sqlite3.connect(db_path)
     try:
