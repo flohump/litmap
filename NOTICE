@@ -1,0 +1,23 @@
+litmap
+Copyright 2026 Douglas Yu and contributors
+
+This product includes software developed at https://github.com/dougwyu/litmap
+and is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Modifications
+--------------------------------------------------------------------------------
+
+This fork (https://github.com/mscrawford/litmap) is derived from upstream commit
+efc3c2a6 and carries the changes listed in FORK-CHANGES.md, as required by
+section 4(b) of the Apache License, Version 2.0.
+
+Modified files: litmap/zotero.py, litmap/embedder.py, litmap/search.py,
+litmap/cli.py, tests/conftest.py, tests/test_embedder.py, README.md,
+docs/tutorial.md.
+
+Added files: litmap/judge.py, scripts/retrieval_panel.py,
+tests/test_author_fidelity.py, tests/test_device.py,
+tests/test_embedder_fulltext.py, tests/test_index_hygiene.py,
+tests/test_judge.py, tests/test_manuscript_cleanup.py, tests/test_meta.py,
+tests/test_pooling_regression.py.
