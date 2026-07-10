@@ -3,9 +3,13 @@ from litmap.zotero import get_all_items, get_collection, get_item, Item
 
 def test_get_all_items_excludes_attachments(zotero_db):
     items = get_all_items(zotero_db)
-    assert len(items) == 3
+    # 3 user-library papers + 1 group-library paper. The attachment, the trashed
+    # paper and the journal-feed item are all excluded.
+    assert len(items) == 4
     keys = {i.key for i in items}
-    assert 'AAAA0003' not in keys  # attachment excluded
+    assert 'AAAA0003' not in keys   # attachment
+    assert 'TRASH0005' not in keys  # in Zotero's trash
+    assert 'FEEDITEM1' not in keys  # subscribed journal feed
 
 
 def test_get_all_items_fields(zotero_db):

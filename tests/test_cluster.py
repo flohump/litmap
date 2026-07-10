@@ -449,7 +449,7 @@ def test_cluster_cmd_warns_on_unembedded_papers(
     conn.commit()
     conn.close()
 
-    # Seed embeddings for 3 of the 4 journalArticle papers.
+    # Seed embeddings for 3 of the 5 papers (AAAA0005 and the group paper are left bare).
     v1 = np.array([1.0] + [0.0] * 767, dtype=np.float32)
     v2 = np.array([0.0, 1.0] + [0.0] * 766, dtype=np.float32)
     v3 = np.array([0.0, 0.0, 1.0] + [0.0] * 765, dtype=np.float32)
@@ -481,7 +481,7 @@ def test_cluster_cmd_warns_on_unembedded_papers(
     )
     assert result.exit_code == 0, (result.stdout, result.stderr)
     combined = (result.stdout or "") + (result.stderr or "")
-    assert "1 of 4 papers have no embedding" in combined
+    assert "2 of 5 papers have no embedding" in combined
     assert "litmap sync" in combined
 
 

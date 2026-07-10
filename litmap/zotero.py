@@ -63,6 +63,29 @@ def _trash_clause(conn: sqlite3.Connection) -> str:
     return " AND i.itemID NOT IN (SELECT itemID FROM deletedItems)"
 
 
+def _feed_clause(conn: sqlite3.Connection) -> str:
+    """SQL excluding items belonging to a Zotero feed library.
+
+    A feed is a subscribed journal table-of-contents, not a library the user
+    curates. Its items arrive automatically, never have attachments, and Zotero
+    deletes them again after a few days (`feeds.cleanupReadAfter` /
+    `cleanupUnreadAfter`). Indexing them means the index is permanently chasing a
+    rolling window of papers the user has not chosen to keep.
+    """
+    if _has_table(conn, "libraries"):
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(libraries)")}
+        if "type" in columns:
+            return " AND i.libraryID NOT IN (SELECT libraryID FROM libraries WHERE type = 'feed')"
+    if _has_table(conn, "feeds"):
+        return " AND i.libraryID NOT IN (SELECT libraryID FROM feeds)"
+    return ""
+
+
+def _exclusions(conn: sqlite3.Connection) -> str:
+    """Everything that is in `items` but is not one of the user's papers."""
+    return _trash_clause(conn) + _feed_clause(conn)
+
+
 def _excluded_type_ids(conn: sqlite3.Connection) -> tuple[int, ...]:
     placeholders = ",".join("?" * len(EXCLUDED_TYPE_NAMES))
     try:
@@ -158,7 +181,7 @@ def _rows_to_items(
     return items
 
 
-def _item_select(excluded_ids: tuple[int, ...], trash_clause: str = "") -> str:
+def _item_select(excluded_ids: tuple[int, ...], extra_where: str = "") -> str:
     """Paper-level SELECT. Creators are NOT joined here.
 
     Joining itemCreators multiplied every item row by its author count and forced
@@ -196,7 +219,7 @@ def _item_select(excluded_ids: tuple[int, ...], trash_clause: str = "") -> str:
     ) att ON att.parentItemID = i.itemID
     LEFT JOIN items atti ON atti.itemID = att.itemID
     WHERE i.itemTypeID NOT IN """ + excluded_sql + """
-      AND tv.value IS NOT NULL""" + trash_clause + """
+      AND tv.value IS NOT NULL""" + extra_where + """
 """
 
 
@@ -214,7 +237,7 @@ def get_all_items(db_path: Path = ZOTERO_DB) -> list[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _item_select(_excluded_type_ids(conn), _trash_clause(conn)),
+            _item_select(_excluded_type_ids(conn), _exclusions(conn)),
             _field_params(fids),
         ).fetchall()
         # item_ids=None: read every creator row rather than build a 16k-wide IN clause
@@ -228,7 +251,7 @@ def get_collection(name: str, db_path: Path = ZOTERO_DB) -> list[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _item_select(_excluded_type_ids(conn), _trash_clause(conn)) + """
+            _item_select(_excluded_type_ids(conn), _exclusions(conn)) + """
               AND i.itemID IN (
                   SELECT ci.itemID FROM collectionItems ci
                   JOIN collections col ON col.collectionID = ci.collectionID
@@ -247,7 +270,7 @@ def get_item(key_or_doi: str, db_path: Path = ZOTERO_DB) -> Optional[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _item_select(_excluded_type_ids(conn), _trash_clause(conn)) + """
+            _item_select(_excluded_type_ids(conn), _exclusions(conn)) + """
               AND (i.key = :val OR doiv.value = :val)
             LIMIT 1
             """,
@@ -272,7 +295,7 @@ def get_subcollection_map(db_path: Path = ZOTERO_DB) -> dict[str, list[str]]:
             FROM items i
             JOIN collectionItems ci ON ci.itemID = i.itemID
             JOIN collections col ON col.collectionID = ci.collectionID
-            WHERE i.itemTypeID NOT IN """ + excluded_sql + _trash_clause(conn) + """
+            WHERE i.itemTypeID NOT IN """ + excluded_sql + _exclusions(conn) + """
             ORDER BY i.key, col.collectionName
             """
         ).fetchall()

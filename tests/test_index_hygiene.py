@@ -54,6 +54,57 @@ def test_get_collection_excludes_trashed(zotero_db):
     assert "TRASH0005" not in keys
 
 
+# ---------------------------------------------------------------------------
+# Feed exclusion
+# ---------------------------------------------------------------------------
+
+def test_feed_items_are_not_indexed(zotero_db):
+    """A subscribed journal feed is a rolling window of papers the user has NOT saved.
+
+    Zotero deletes feed items again after `cleanupReadAfter` days, so indexing them
+    means the index permanently chases churn -- and generates orphan vectors for
+    papers that were never in the library.
+    """
+    keys = {i.key for i in get_all_items(zotero_db)}
+    assert "FEEDITEM1" not in keys
+
+
+def test_group_library_papers_are_still_indexed(zotero_db):
+    """Guard against over-exclusion: only `feed` libraries go, not every non-user one."""
+    keys = {i.key for i in get_all_items(zotero_db)}
+    assert "GROUPPAPR" in keys
+
+
+def test_get_item_refuses_a_feed_key(zotero_db):
+    assert get_item("FEEDITEM1", zotero_db) is None
+
+
+def test_sync_prunes_feed_vectors_left_by_the_old_code(synced_db, zotero_db, make_vector_fn):
+    store_vector(synced_db, "FEEDITEM1", make_vector_fn(11))
+    report = sync(synced_db, zotero_db)
+    assert report.n_pruned == 1
+    assert "FEEDITEM1" not in _keys(synced_db)
+
+
+def test_feed_exclusion_when_libraries_table_is_absent(tmp_path):
+    """Old Zotero schemas predate feeds; fall back to the `feeds` table, then to nothing."""
+    from litmap.zotero import _connect, _feed_clause
+
+    db_path = tmp_path / "no_libraries.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.executescript("CREATE TABLE placeholder (x INTEGER);")
+    conn.commit(); conn.close()
+    with _connect(db_path) as c:
+        assert _feed_clause(c) == ""
+
+    db2 = tmp_path / "feeds_only.sqlite"
+    conn = sqlite3.connect(db2)
+    conn.executescript("CREATE TABLE feeds (libraryID INTEGER PRIMARY KEY, name TEXT);")
+    conn.commit(); conn.close()
+    with _connect(db2) as c:
+        assert "feeds" in _feed_clause(c)
+
+
 def test_works_when_deleteditems_table_is_absent(tmp_path):
     """Older Zotero schemas have no deletedItems table; do not crash."""
     import shutil

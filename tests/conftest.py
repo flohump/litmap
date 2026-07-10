@@ -84,6 +84,40 @@ def zotero_db(tmp_path):
         CREATE TABLE deletedItems (itemID INTEGER PRIMARY KEY, dateDeleted TEXT);
         INSERT INTO deletedItems VALUES (50, '2026-07-01 00:00:00');
 
+        -- A subscribed journal feed. Its items arrive automatically, have no
+        -- attachments, and Zotero deletes them again after a few days. They are
+        -- not the user's library and must never be indexed.
+        CREATE TABLE libraries (libraryID INTEGER PRIMARY KEY, type TEXT);
+        INSERT INTO libraries VALUES (1, 'user');
+        INSERT INTO libraries VALUES (7, 'group');
+        INSERT INTO libraries VALUES (9, 'feed');
+        CREATE TABLE feeds (
+            libraryID INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL,
+            cleanupReadAfter INT, cleanupUnreadAfter INT
+        );
+        INSERT INTO feeds VALUES (9, 'Nature', 'https://example.org/nature.rss', 3, 30);
+
+        INSERT INTO items VALUES (60, 2, 9, 'FEEDITEM1');
+        INSERT INTO itemDataValues VALUES (601, 'A Paper I Have Not Saved');
+        INSERT INTO itemDataValues VALUES (602, 'Abstract from a journal feed');
+        INSERT INTO itemDataValues VALUES (603, '2026');
+        INSERT INTO itemDataValues VALUES (604, '10.3333/feed');
+        INSERT INTO itemData VALUES (60, 1, 601);
+        INSERT INTO itemData VALUES (60, 2, 602);
+        INSERT INTO itemData VALUES (60, 6, 603);
+        INSERT INTO itemData VALUES (60, 8, 604);
+
+        -- A genuine paper in a group library: NOT a feed, must stay indexed.
+        INSERT INTO items VALUES (70, 2, 7, 'GROUPPAPR');
+        INSERT INTO itemDataValues VALUES (701, 'Shared Group Library Paper');
+        INSERT INTO itemDataValues VALUES (702, 'Abstract from a group library');
+        INSERT INTO itemDataValues VALUES (703, '2025');
+        INSERT INTO itemDataValues VALUES (704, '10.4444/group');
+        INSERT INTO itemData VALUES (70, 1, 701);
+        INSERT INTO itemData VALUES (70, 2, 702);
+        INSERT INTO itemData VALUES (70, 6, 703);
+        INSERT INTO itemData VALUES (70, 8, 704);
+
         CREATE TABLE creators (creatorID INTEGER PRIMARY KEY, firstName TEXT, lastName TEXT);
         INSERT INTO creators VALUES (1, 'Jane', 'Smith');
         INSERT INTO creators VALUES (2, 'Bob', 'Jones');
