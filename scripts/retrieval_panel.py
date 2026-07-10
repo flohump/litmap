@@ -16,35 +16,37 @@ Two panels are run over the same sampled papers:
      without it, "no improvement" is ambiguous between "no benefit" and
      "nothing was measured".
 
-  B. ESTIMATE -- the query is a research question written by a local LLM from that
-     same passage, forbidden from copying long runs of its wording. This is the
-     honest measurement: it approximates a human asking a conceptual question whose
-     answer sits in a paper's methods or results rather than its abstract.
+  B. ESTIMATE -- the query is a research question written FROM that passage, in
+     someone else's words. This is the honest measurement: it approximates a human
+     asking a conceptual question whose answer sits in a paper's methods or results
+     rather than its abstract.
 
-Panel B is an optimistic proxy in one direction (the question is generated from the
-passage, so it retains its conceptual specificity) and pessimistic in another (it
-never sees the paper's title). Report it as an estimate, not a user-facing metric.
+Panel B is an optimistic proxy in one direction (the question is written with the
+passage in view, so it retains its conceptual specificity) and pessimistic in
+another (it never sees the paper's title). Report it as an estimate, not a
+user-facing metric. The population is also biased: only papers with a local PDF can
+be sampled, and those are the only papers chunking can help. Panel B therefore
+measures the best case, not the library-wide effect.
 
-Privacy
--------
-No paper text, title, or author is ever printed. Passages and generated questions
-are written to a queries file so the before/after runs use IDENTICAL queries; that
-file is not meant to be read by the operator. Output carries opaque Zotero keys,
-ranks and similarity scores only.
+Workflow
+--------
+    # 1. Sample papers and cut one deep passage from each PDF.
+    python scripts/retrieval_panel.py --extract --n 14
 
-Usage
------
-    # BEFORE the backfill, while fulltext_chunks is empty:
-    uv run --project ~/src/Cowork/litmap python scripts/retrieval_panel.py \
-        --label baseline --n 24
+    # 2. Read ~/LitLake/panel_passages.json and write ~/LitLake/panel_queries.json:
+    #      {"<key>": {"passage": "...", "question": "..."}}
+    #    Write each question WITHOUT copying long runs of the passage's wording.
+    #    (--use-ollama does this with a local model instead, for unattended runs.)
 
-    # AFTER `litmap sync-fulltext`, reusing the same queries:
-    uv run --project ~/src/Cowork/litmap python scripts/retrieval_panel.py \
-        --label chunked
+    # 3. BEFORE the backfill, while fulltext_chunks is empty:
+    python scripts/retrieval_panel.py --label baseline
 
-    # Compare:
-    uv run --project ~/src/Cowork/litmap python scripts/retrieval_panel.py \
-        --compare baseline chunked
+    # 4. AFTER `litmap sync-fulltext`, reusing the SAME queries:
+    python scripts/retrieval_panel.py --label chunked
+    python scripts/retrieval_panel.py --compare baseline chunked
+
+The queries file is written once and reused. Both runs must use identical queries,
+or the comparison measures the queries rather than the index.
 """
 from __future__ import annotations
 
@@ -67,6 +69,7 @@ from litmap.zotero import ZOTERO_DB, get_all_items  # noqa: E402
 
 PANEL_DIR = Path.home() / "LitLake"
 QUERIES_FILE = PANEL_DIR / "panel_queries.json"
+PASSAGES_FILE = PANEL_DIR / "panel_passages.json"
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 JUDGE_MODEL = "gemma4:26b"
@@ -96,6 +99,7 @@ def generate_question(passage: str) -> str:
         "model": JUDGE_MODEL,
         "stream": False,
         "format": _QUESTION_SCHEMA,
+        "think": False,          # gemma4 is a thinking model; reasoning here is wasted
         "options": {"temperature": 0, "num_ctx": 4096},
         "messages": [
             {"role": "system", "content": _SYSTEM},
@@ -131,16 +135,16 @@ def longest_shared_ngram(a: str, b: str, cap: int = 12) -> int:
     return best
 
 
-def build_queries(n: int, seed: int) -> dict:
-    """Sample papers with a long PDF, cut one deep passage each, write a question."""
+def extract_passages(n: int, seed: int) -> dict:
+    """Sample papers with a long PDF and cut one deep passage from each."""
     items = [i for i in get_all_items(ZOTERO_DB) if i.pdf_path is not None]
     items.sort(key=lambda i: i.key)                     # deterministic order
     random.Random(seed).shuffle(items)
 
-    queries: dict[str, dict] = {}
+    passages: dict[str, str] = {}
     scanned = 0
     for item in items:
-        if len(queries) >= n:
+        if len(passages) >= n:
             break
         scanned += 1
         text, err = _extract_pdf_text(item.pdf_path)
@@ -149,21 +153,44 @@ def build_queries(n: int, seed: int) -> dict:
         lo, hi = int(len(text) * BODY_START), int(len(text) * BODY_END) - PASSAGE_CHARS
         if hi <= lo:
             continue
-        start = random.Random(seed + len(queries)).randint(lo, hi)
+        start = random.Random(seed + len(passages)).randint(lo, hi)
         passage = " ".join(text[start:start + PASSAGE_CHARS].split())
         if len(passage) < PASSAGE_CHARS * 0.6:
             continue
-        question = generate_question(passage)
-        queries[item.key] = {
+        passages[item.key] = passage
+        print(f"  {len(passages):>3}/{n}  {item.key}", flush=True)
+
+    print(f"  scanned {scanned} PDFs to cut {len(passages)} usable passages")
+    return passages
+
+
+def queries_from_passages(passages: dict, use_ollama: bool) -> dict:
+    """Attach a question to each passage. Only used by the --use-ollama path."""
+    queries = {}
+    for key, passage in passages.items():
+        question = generate_question(passage) if use_ollama else ""
+        queries[key] = {
             "passage": passage,
             "question": question,
-            "leak_ngram": longest_shared_ngram(question, passage),
+            "leak_ngram": longest_shared_ngram(question, passage) if question else 0,
         }
-        print(f"  built {len(queries):>3}/{n}  key={item.key}  leak={queries[item.key]['leak_ngram']}w",
-              flush=True)
-
-    print(f"  scanned {scanned} PDFs to build {len(queries)} usable queries")
+        print(f"  {key}  leak={queries[key]['leak_ngram']}w", flush=True)
     return queries
+
+
+def validate_queries(queries: dict) -> None:
+    """A missing or plagiarised question silently turns panel B into panel A."""
+    problems = []
+    for key, q in queries.items():
+        if not q.get("question", "").strip():
+            problems.append(f"{key}: no question")
+            continue
+        leak = longest_shared_ngram(q["question"], q["passage"])
+        q["leak_ngram"] = leak
+        if leak > 5:
+            problems.append(f"{key}: question copies {leak} consecutive words from the passage")
+    if problems:
+        raise SystemExit("queries file rejected:\n  " + "\n  ".join(problems))
 
 
 def rank_of(key: str, query_text: str) -> tuple[int | None, float | None, float]:
@@ -192,6 +219,7 @@ def metrics(ranks: list[int | None]) -> dict:
 
 def run_panel(label: str) -> dict:
     queries = json.loads(QUERIES_FILE.read_text())
+    validate_queries(queries)
     rows = []
     for i, (key, q) in enumerate(sorted(queries.items()), start=1):
         rank_a, sim_a, top1_a = rank_of(key, q["passage"])
@@ -270,24 +298,34 @@ def compare(before: str, after: str) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--label", help="name this run (e.g. baseline, chunked)")
-    p.add_argument("--n", type=int, default=24, help="papers to sample when building queries")
+    p.add_argument("--extract", action="store_true", help="cut passages, then stop")
+    p.add_argument("--use-ollama", action="store_true",
+                   help="write the questions with a local model instead of by hand")
+    p.add_argument("--n", type=int, default=14, help="papers to sample")
     p.add_argument("--seed", type=int, default=20260710)
-    p.add_argument("--rebuild-queries", action="store_true")
     p.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"))
     args = p.parse_args()
 
     if args.compare:
         compare(*args.compare)
         return
-    if not args.label:
-        p.error("--label is required unless --compare is used")
 
-    if args.rebuild_queries or not QUERIES_FILE.exists():
-        print(f"building {args.n} planted queries (this reads PDFs and calls {JUDGE_MODEL})")
-        QUERIES_FILE.write_text(json.dumps(build_queries(args.n, args.seed), indent=2))
-        print(f"wrote {QUERIES_FILE} (contains paper text -- not for display)")
-    else:
-        print(f"reusing existing queries from {QUERIES_FILE}")
+    if args.extract:
+        passages = extract_passages(args.n, args.seed)
+        PASSAGES_FILE.write_text(json.dumps(passages, indent=2))
+        print(f"\nwrote {PASSAGES_FILE}")
+        if args.use_ollama:
+            QUERIES_FILE.write_text(json.dumps(queries_from_passages(passages, True), indent=2))
+            print(f"wrote {QUERIES_FILE}")
+        else:
+            print(f"now write {QUERIES_FILE} as "
+                  '{"<key>": {"passage": "...", "question": "..."}}')
+        return
+
+    if not args.label:
+        p.error("--label is required unless --extract or --compare is used")
+    if not QUERIES_FILE.exists():
+        raise SystemExit(f"{QUERIES_FILE} not found. Run with --extract first.")
 
     show(run_panel(args.label))
 
