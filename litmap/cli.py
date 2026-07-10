@@ -349,15 +349,28 @@ def info_cmd(
 @app.command("sync")
 def sync_cmd(
     force: bool = typer.Option(False, "--force", help="Re-embed all papers, even those already in the cache"),
+    allow_large_prune: bool = typer.Option(
+        False, "--allow-large-prune",
+        help="Permit pruning more than a quarter of the index in one run",
+    ),
     db_path: Path = typer.Option(_DEFAULT_DB, hidden=True),
     zotero_db: Path = typer.Option(_DEFAULT_ZOTERO, hidden=True),
 ):
     """Sync Zotero items into embeddings DB. Use --force to regenerate all embeddings."""
     from litmap.embedder import sync, ModelMismatchError
     try:
-        report = sync(db_path, zotero_db, force=force)
+        report = sync(db_path, zotero_db, force=force, allow_large_prune=allow_large_prune)
     except ModelMismatchError as e:
         _fatal(str(e), code=2)
+
+    if report.n_prune_refused:
+        typer.echo(
+            f"Refused to prune {report.n_prune_refused} vectors: that is more than a "
+            f"quarter of the index.\nZotero may have been mid-write, or the wrong "
+            f"library was read. Nothing was deleted.\nIf the removal is genuine, re-run "
+            f"with --allow-large-prune.",
+            err=True,
+        )
     if report.n_embedded == 0 and report.n_pruned == 0:
         typer.echo("Already up to date.")
     else:
@@ -366,7 +379,7 @@ def sync_cmd(
         if report.n_pruned:
             typer.echo(
                 f"Pruned {report.n_pruned} stale vectors "
-                f"(papers deleted from Zotero, trashed, or never citable)."
+                f"(papers deleted from Zotero, trashed, in a feed, or never citable)."
             )
 
 

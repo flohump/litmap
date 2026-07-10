@@ -196,25 +196,51 @@ def _purge_fulltext(db_path: Path) -> None:
     conn.close()
 
 
+# A prune wider than this fraction of the index is refused unless explicitly
+# allowed. `sync` runs unattended from a SessionStart hook, and pruning a paper
+# also drops its full-text chunks -- hours of work. A partial or transient read of
+# zotero.sqlite (mid-write, mid-sync, wrong path) looks exactly like "the user
+# deleted almost everything", and must not be acted on silently.
+_MAX_PRUNE_FRACTION = 0.25
+# Below this many rows the fraction is meaningless; a fresh index prunes freely.
+_PRUNE_GUARD_MIN_ROWS = 50
+
+
 @dataclass
 class SyncReport:
     n_embedded: int = 0
     n_pruned: int = 0
+    # Non-zero when the prune guard tripped: this many stale vectors were left alone.
+    n_prune_refused: int = 0
 
 
-def _prune_stale(db_path: Path, valid_keys: set[str]) -> int:
+def _prune_stale(
+    db_path: Path,
+    valid_keys: set[str],
+    allow_large_prune: bool = False,
+) -> tuple[int, int]:
     """Delete vectors whose paper is no longer a citable item in Zotero.
 
     `sync` only ever inserted, so an index accumulated vectors for papers the
     user deleted, for items that were never papers, and for anything a past bug
     let through. They stayed searchable forever. Embeddings are derived data --
     deleting one costs a re-embed, keeping one corrupts every ranking.
+
+    Returns (n_pruned, n_refused).
     """
     conn = sqlite3.connect(db_path)
-    stale = [
-        key for (key,) in conn.execute("SELECT zotero_key FROM embeddings")
-        if key not in valid_keys and key != MANUSCRIPT_KEY
-    ]
+    all_keys = [k for (k,) in conn.execute("SELECT zotero_key FROM embeddings")]
+    stale = [k for k in all_keys if k not in valid_keys and k != MANUSCRIPT_KEY]
+
+    if (
+        stale
+        and not allow_large_prune
+        and len(all_keys) >= _PRUNE_GUARD_MIN_ROWS
+        and len(stale) / len(all_keys) > _MAX_PRUNE_FRACTION
+    ):
+        conn.close()
+        return 0, len(stale)
+
     if stale:
         params = [(k,) for k in stale]
         conn.executemany("DELETE FROM embeddings WHERE zotero_key = ?", params)
@@ -224,13 +250,14 @@ def _prune_stale(db_path: Path, valid_keys: set[str]) -> int:
             pass
         conn.commit()
     conn.close()
-    return len(stale)
+    return len(stale), 0
 
 
 def sync(
     db_path: Path = EMBEDDINGS_DB,
     zotero_db: Path = ZOTERO_DB,
     force: bool = False,
+    allow_large_prune: bool = False,
 ) -> SyncReport:
     previous_model = _stored_model(db_path)
     # A mismatch is fatal unless we are about to re-embed everything anyway.
@@ -254,8 +281,13 @@ def sync(
 
     # An empty library means the read failed or the DB is wrong. Never take that
     # as licence to delete the whole index.
-    n_pruned = _prune_stale(db_path, {i.key for i in all_items}) if all_items else 0
-    return SyncReport(n_embedded=len(items_to_embed), n_pruned=n_pruned)
+    n_pruned, n_refused = (
+        _prune_stale(db_path, {i.key for i in all_items}, allow_large_prune)
+        if all_items else (0, 0)
+    )
+    return SyncReport(
+        n_embedded=len(items_to_embed), n_pruned=n_pruned, n_prune_refused=n_refused
+    )
 
 
 def _existing_keys(db_path: Path) -> set[str]:

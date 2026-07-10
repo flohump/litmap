@@ -1,7 +1,7 @@
 """The embeddings index must contain citable papers, and only citable papers.
 
-Three defects, all found by auditing a real 2,898-row index against the library
-it was built from. 44% of those rows were not papers:
+Four defects, all found by auditing a real 2,898-row index against the library it
+was built from. 48% of those rows were not papers the user had chosen to keep:
 
   644 attachments  -- itemTypeIDs were hardcoded as (14, 26). In Zotero 9 those
                       are `email` and `newspaperArticle`; attachment is 3 and
@@ -11,10 +11,16 @@ it was built from. 44% of those rows were not papers:
   606 orphans      -- items deleted from Zotero. `sync` only ever INSERTed; it
                       had no way to remove a vector, so deleted papers were
                       searchable forever.
+  116 feed items   -- subscribed journal tables-of-contents. Zotero deletes them
+                      again after a few days, so indexing them means chasing a
+                      rolling window -- and is where most of the orphans came from.
    16 trashed      -- items sitting in Zotero's Trash. They remain in `items`
                       until the trash is emptied, and litmap never excluded them.
 
 Every one of these competes with real papers for a place in the top-K.
+
+The prune that fixes them is itself dangerous once `sync` runs unattended, so it
+carries a safety valve: a prune wider than a quarter of the index is refused.
 """
 import sqlite3
 from unittest.mock import patch
@@ -23,6 +29,7 @@ import numpy as np
 import pytest
 
 from litmap.embedder import DIMS, MANUSCRIPT_KEY, init_db, sync
+from litmap.embedder import _MAX_PRUNE_FRACTION, _PRUNE_GUARD_MIN_ROWS  # noqa: F401
 from litmap.zotero import get_all_items, get_collection, get_item
 from tests.conftest import store_vector
 
@@ -222,3 +229,95 @@ def test_prune_is_skipped_when_zotero_returns_nothing(synced_db, zotero_db, monk
     report = sync(synced_db, zotero_db)
     assert report.n_pruned == 0
     assert _keys(synced_db) == before
+
+
+# ---------------------------------------------------------------------------
+# Prune safety valve
+# ---------------------------------------------------------------------------
+
+def _index_with(tmp_path, make_vector_fn, n_valid, n_stale):
+    """A bare index: n_valid keys that exist in Zotero, n_stale that do not."""
+    db_path = tmp_path / "guard.db"
+    init_db(db_path)
+    valid = {f"REAL{i:04d}" for i in range(n_valid)}
+    for i, k in enumerate(sorted(valid)):
+        store_vector(db_path, k, make_vector_fn(i))
+    for i in range(n_stale):
+        store_vector(db_path, f"GONE{i:04d}", make_vector_fn(1000 + i))
+    return db_path, valid
+
+
+def test_prune_refuses_to_delete_more_than_a_quarter_of_the_index(tmp_path, make_vector_fn):
+    """A partial read of zotero.sqlite looks exactly like a mass deletion.
+
+    sync runs unattended from a SessionStart hook, and pruning a paper also drops
+    its full-text chunks. Acting on a transient read would throw away hours of
+    embedding work, silently and without anyone watching.
+    """
+    from litmap.embedder import _prune_stale
+    db_path, valid = _index_with(tmp_path, make_vector_fn, n_valid=60, n_stale=40)
+    before = _keys(db_path)
+
+    n_pruned, n_refused = _prune_stale(db_path, valid)
+
+    assert (n_pruned, n_refused) == (0, 40)          # 40 of 100 rows = 40% > 25%
+    assert _keys(db_path) == before, "nothing may be deleted when the guard trips"
+
+
+def test_allow_large_prune_overrides_the_guard(tmp_path, make_vector_fn):
+    from litmap.embedder import _prune_stale
+    db_path, valid = _index_with(tmp_path, make_vector_fn, n_valid=60, n_stale=40)
+    n_pruned, n_refused = _prune_stale(db_path, valid, allow_large_prune=True)
+    assert (n_pruned, n_refused) == (40, 0)
+    assert _keys(db_path) == valid
+
+
+def test_a_prune_under_the_limit_proceeds_without_the_flag(tmp_path, make_vector_fn):
+    from litmap.embedder import _prune_stale
+    db_path, valid = _index_with(tmp_path, make_vector_fn, n_valid=90, n_stale=10)
+    n_pruned, n_refused = _prune_stale(db_path, valid)
+    assert (n_pruned, n_refused) == (10, 0)          # 10% < 25%
+    assert _keys(db_path) == valid
+
+
+def test_guard_does_not_apply_to_a_small_index(tmp_path, make_vector_fn):
+    """A fresh index of a handful of rows must still be able to prune all of them."""
+    from litmap.embedder import _prune_stale
+    db_path, valid = _index_with(tmp_path, make_vector_fn, n_valid=3, n_stale=2)
+    n_pruned, n_refused = _prune_stale(db_path, valid)
+    assert (n_pruned, n_refused) == (2, 0)           # 5 rows, below the guard minimum
+
+
+def test_guard_keeps_the_manuscript_row_out_of_the_fraction(tmp_path, make_vector_fn):
+    from litmap.embedder import _prune_stale
+    db_path, valid = _index_with(tmp_path, make_vector_fn, n_valid=60, n_stale=1)
+    store_vector(db_path, MANUSCRIPT_KEY, make_vector_fn(7))
+    n_pruned, n_refused = _prune_stale(db_path, valid)
+    assert (n_pruned, n_refused) == (1, 0)
+    assert MANUSCRIPT_KEY in _keys(db_path)
+
+
+def test_sync_surfaces_a_refused_prune(synced_db, zotero_db, make_vector_fn):
+    for i in range(60):
+        store_vector(synced_db, f"GONE{i:04d}", make_vector_fn(2000 + i))
+    report = sync(synced_db, zotero_db)
+    assert report.n_pruned == 0
+    assert report.n_prune_refused == 60
+    assert "AAAA0001" in _keys(synced_db)
+
+
+def test_cli_reports_a_refused_prune_and_names_the_override(
+    synced_db, zotero_db, make_vector_fn
+):
+    from typer.testing import CliRunner
+    from litmap.cli import app
+
+    for i in range(60):
+        store_vector(synced_db, f"GONE{i:04d}", make_vector_fn(2000 + i))
+    result = CliRunner().invoke(
+        app, ["sync", "--db-path", str(synced_db), "--zotero-db", str(zotero_db)]
+    )
+    assert result.exit_code == 0
+    assert "Refused to prune" in result.output
+    assert "--allow-large-prune" in result.output
+    assert "AAAA0001" in _keys(synced_db)
