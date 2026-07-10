@@ -40,6 +40,10 @@ def zotero_db(tmp_path):
         INSERT INTO items VALUES (2, 2, 1, 'AAAA0002');
         INSERT INTO items VALUES (3, 14, 1, 'AAAA0003');
         INSERT INTO items VALUES (4, 2, 1, 'AAAA0004');
+        -- A paper the user moved to the Trash. Zotero keeps it in `items` until
+        -- the trash is emptied, so every query must exclude it explicitly.
+        -- (itemID 50 / valueIDs 50x: tests add their own rows at 5 / 40x.)
+        INSERT INTO items VALUES (50, 2, 1, 'TRASH0005');
 
         CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
         INSERT INTO itemDataValues VALUES (101, 'Ecology of Networks');
@@ -54,6 +58,10 @@ def zotero_db(tmp_path):
         INSERT INTO itemDataValues VALUES (302, 'Abstract about traits');
         INSERT INTO itemDataValues VALUES (303, '2023');
         INSERT INTO itemDataValues VALUES (304, '10.1111/trait');
+        INSERT INTO itemDataValues VALUES (501, 'Discarded Duplicate Paper');
+        INSERT INTO itemDataValues VALUES (502, 'Abstract of a trashed item');
+        INSERT INTO itemDataValues VALUES (503, '2024');
+        INSERT INTO itemDataValues VALUES (504, '10.2222/trash');
 
         CREATE TABLE itemData (itemID INTEGER, fieldID INTEGER, valueID INTEGER);
         INSERT INTO itemData VALUES (1, 1, 101);
@@ -68,16 +76,25 @@ def zotero_db(tmp_path):
         INSERT INTO itemData VALUES (4, 2, 302);
         INSERT INTO itemData VALUES (4, 6, 303);
         INSERT INTO itemData VALUES (4, 8, 304);
+        INSERT INTO itemData VALUES (50, 1, 501);
+        INSERT INTO itemData VALUES (50, 2, 502);
+        INSERT INTO itemData VALUES (50, 6, 503);
+        INSERT INTO itemData VALUES (50, 8, 504);
+
+        CREATE TABLE deletedItems (itemID INTEGER PRIMARY KEY, dateDeleted TEXT);
+        INSERT INTO deletedItems VALUES (50, '2026-07-01 00:00:00');
 
         CREATE TABLE creators (creatorID INTEGER PRIMARY KEY, firstName TEXT, lastName TEXT);
         INSERT INTO creators VALUES (1, 'Jane', 'Smith');
         INSERT INTO creators VALUES (2, 'Bob', 'Jones');
+        INSERT INTO creators VALUES (3, 'Kim', 'Trashed');
 
         CREATE TABLE itemCreators (
             itemID INTEGER, creatorID INTEGER, creatorTypeID INTEGER, orderIndex INTEGER
         );
         INSERT INTO itemCreators VALUES (1, 1, 1, 0);
         INSERT INTO itemCreators VALUES (2, 2, 1, 0);
+        INSERT INTO itemCreators VALUES (50, 3, 1, 0);
 
         CREATE TABLE collections (
             collectionID INTEGER PRIMARY KEY,

@@ -348,13 +348,19 @@ def sync_cmd(
     """Sync Zotero items into embeddings DB. Use --force to regenerate all embeddings."""
     from litmap.embedder import sync, ModelMismatchError
     try:
-        count = sync(db_path, zotero_db, force=force)
+        report = sync(db_path, zotero_db, force=force)
     except ModelMismatchError as e:
         _fatal(str(e), code=2)
-    if count == 0:
+    if report.n_embedded == 0 and report.n_pruned == 0:
         typer.echo("Already up to date.")
     else:
-        typer.echo(f"Embedded {count} new papers.")
+        if report.n_embedded:
+            typer.echo(f"Embedded {report.n_embedded} new papers.")
+        if report.n_pruned:
+            typer.echo(
+                f"Pruned {report.n_pruned} stale vectors "
+                f"(papers deleted from Zotero, trashed, or never citable)."
+            )
 
 
 @app.command("sync-fulltext")

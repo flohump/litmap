@@ -196,11 +196,42 @@ def _purge_fulltext(db_path: Path) -> None:
     conn.close()
 
 
+@dataclass
+class SyncReport:
+    n_embedded: int = 0
+    n_pruned: int = 0
+
+
+def _prune_stale(db_path: Path, valid_keys: set[str]) -> int:
+    """Delete vectors whose paper is no longer a citable item in Zotero.
+
+    `sync` only ever inserted, so an index accumulated vectors for papers the
+    user deleted, for items that were never papers, and for anything a past bug
+    let through. They stayed searchable forever. Embeddings are derived data --
+    deleting one costs a re-embed, keeping one corrupts every ranking.
+    """
+    conn = sqlite3.connect(db_path)
+    stale = [
+        key for (key,) in conn.execute("SELECT zotero_key FROM embeddings")
+        if key not in valid_keys and key != MANUSCRIPT_KEY
+    ]
+    if stale:
+        params = [(k,) for k in stale]
+        conn.executemany("DELETE FROM embeddings WHERE zotero_key = ?", params)
+        try:
+            conn.executemany("DELETE FROM fulltext_chunks WHERE zotero_key = ?", params)
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+    conn.close()
+    return len(stale)
+
+
 def sync(
     db_path: Path = EMBEDDINGS_DB,
     zotero_db: Path = ZOTERO_DB,
     force: bool = False,
-) -> int:
+) -> SyncReport:
     previous_model = _stored_model(db_path)
     # A mismatch is fatal unless we are about to re-embed everything anyway.
     init_db(db_path, expect_model=not force)
@@ -212,15 +243,19 @@ def sync(
     else:
         existing_keys = _existing_keys(db_path)
         items_to_embed = [i for i in all_items if i.key not in existing_keys]
-    if not items_to_embed:
-        return 0
-    _embed_and_store(items_to_embed, db_path)
+
+    if items_to_embed:
+        _embed_and_store(items_to_embed, db_path)
 
     # Adopt the new model only once every vector has been rewritten under it.
     if force and model_changed:
         _adopt_model(db_path)
         _purge_fulltext(db_path)
-    return len(items_to_embed)
+
+    # An empty library means the read failed or the DB is wrong. Never take that
+    # as licence to delete the whole index.
+    n_pruned = _prune_stale(db_path, {i.key for i in all_items}) if all_items else 0
+    return SyncReport(n_embedded=len(items_to_embed), n_pruned=n_pruned)
 
 
 def _existing_keys(db_path: Path) -> set[str]:

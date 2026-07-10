@@ -45,6 +45,24 @@ def _author_type_id(conn: sqlite3.Connection) -> int:
     return row["creatorTypeID"] if row else 1
 
 
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _trash_clause(conn: sqlite3.Connection) -> str:
+    """SQL excluding items sitting in Zotero's Trash.
+
+    Deleting a paper in Zotero only adds a row to `deletedItems`; the item stays
+    in `items` until the trash is emptied. Without this, papers the user threw
+    away keep coming back in search results.
+    """
+    if not _has_table(conn, "deletedItems"):
+        return ""
+    return " AND i.itemID NOT IN (SELECT itemID FROM deletedItems)"
+
+
 def _excluded_type_ids(conn: sqlite3.Connection) -> tuple[int, ...]:
     placeholders = ",".join("?" * len(EXCLUDED_TYPE_NAMES))
     try:
@@ -140,7 +158,7 @@ def _rows_to_items(
     return items
 
 
-def _item_select(excluded_ids: tuple[int, ...]) -> str:
+def _item_select(excluded_ids: tuple[int, ...], trash_clause: str = "") -> str:
     """Paper-level SELECT. Creators are NOT joined here.
 
     Joining itemCreators multiplied every item row by its author count and forced
@@ -178,7 +196,7 @@ def _item_select(excluded_ids: tuple[int, ...]) -> str:
     ) att ON att.parentItemID = i.itemID
     LEFT JOIN items atti ON atti.itemID = att.itemID
     WHERE i.itemTypeID NOT IN """ + excluded_sql + """
-      AND tv.value IS NOT NULL
+      AND tv.value IS NOT NULL""" + trash_clause + """
 """
 
 
@@ -196,7 +214,7 @@ def get_all_items(db_path: Path = ZOTERO_DB) -> list[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _item_select(_excluded_type_ids(conn)),
+            _item_select(_excluded_type_ids(conn), _trash_clause(conn)),
             _field_params(fids),
         ).fetchall()
         # item_ids=None: read every creator row rather than build a 16k-wide IN clause
@@ -210,7 +228,7 @@ def get_collection(name: str, db_path: Path = ZOTERO_DB) -> list[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _item_select(_excluded_type_ids(conn)) + """
+            _item_select(_excluded_type_ids(conn), _trash_clause(conn)) + """
               AND i.itemID IN (
                   SELECT ci.itemID FROM collectionItems ci
                   JOIN collections col ON col.collectionID = ci.collectionID
@@ -229,7 +247,7 @@ def get_item(key_or_doi: str, db_path: Path = ZOTERO_DB) -> Optional[Item]:
         fids = _field_ids(conn)
         atid = _author_type_id(conn)
         rows = conn.execute(
-            _item_select(_excluded_type_ids(conn)) + """
+            _item_select(_excluded_type_ids(conn), _trash_clause(conn)) + """
               AND (i.key = :val OR doiv.value = :val)
             LIMIT 1
             """,
@@ -254,7 +272,7 @@ def get_subcollection_map(db_path: Path = ZOTERO_DB) -> dict[str, list[str]]:
             FROM items i
             JOIN collectionItems ci ON ci.itemID = i.itemID
             JOIN collections col ON col.collectionID = ci.collectionID
-            WHERE i.itemTypeID NOT IN """ + excluded_sql + """
+            WHERE i.itemTypeID NOT IN """ + excluded_sql + _trash_clause(conn) + """
             ORDER BY i.key, col.collectionName
             """
         ).fetchall()
