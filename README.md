@@ -1,5 +1,22 @@
 # litmap
 
+> ### This is a patched fork
+>
+> Forked from [`dougwyu/litmap`](https://github.com/dougwyu/litmap) at `efc3c2a6`.
+> **[`FORK-CHANGES.md`](FORK-CHANGES.md) lists what differs and why** — including four
+> bugs that silently corrupt the search index on any Zotero 9 library, and a
+> retrieval change measured against planted answers ([`docs/VALIDATION.md`](docs/VALIDATION.md)).
+>
+> If you are running upstream litmap today, the thirty-second read-only check in
+> `FORK-CHANGES.md` will tell you how much of your index is not papers. On the
+> library that prompted this fork, it was 48%.
+>
+> Branches: `fulltext-chunks` is the work. `master` is the pristine upstream commit
+> this was forked from, kept for provenance. `upstream-master` parks upstream's
+> current tip, unaudited — **do not merge it**: its author-order fix requires
+> SQLite ≥ 3.44 and is a hard syntax error on the Python 3.11 that `pyproject.toml`
+> declares support for.
+
 A local Python CLI for semantic mapping and search over your [Zotero](https://www.zotero.org/) library. Generate interactive 2D maps of papers positioned by meaning, find papers similar to a query or focal paper, and understand how your manuscript sits within its citation landscape.
 
 Everything runs locally — no background daemon, no network calls after the first model download, no opaque installers.
