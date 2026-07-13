@@ -71,6 +71,28 @@ The panel also yields the data to calibrate a "nothing relevant" cut-off. Add a
 handful of deliberately out-of-domain questions — topics your library certainly does
 not cover — and compare their top-1 similarity against the in-domain ones.
 
+### What the calibration measured
+
+Fourteen in-domain questions — each with a known answer in the library — and eight
+deliberately out-of-domain ones (superconducting qubits, Byzantine architecture,
+myeloma, baroque flute fingering) separate cleanly, but only on the **top-1
+similarity of the result list**:
+
+- out-of-domain top-1 never exceeded **0.711**;
+- in-domain top-1 was always **≥ 0.767**, and that floor held in *both* regimes —
+  chunked full text and title+abstract only.
+
+The separating margin is therefore just **0.056**. Gate the top-1 at about **0.74**
+and it answers one question reliably, and one only: *does this library contain
+anything on topic?* Because the margin is so narrow, treat **0.71–0.78** as a grey
+zone — read the abstract rather than trust the number.
+
+The gate is a property of the whole result list, never of an individual candidate: it
+does not say whether any one paper is relevant (warning 1 below), and candidate scores
+are not comparable across papers, because full-text and title+abstract-only papers sit
+on different scales. Same caveats as the panel above: n = 14 in-domain + 8
+out-of-domain queries, one library, one embedding model.
+
 Two warnings, both learned the hard way on a real library:
 
 1. **Gate on the top-1 of the result list, not on a candidate's own score.** A paper

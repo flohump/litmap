@@ -53,9 +53,9 @@ def test_get_item_and_get_all_items_agree_on_authors(zotero_db_authors):
 
 
 def test_excluded_types_resolved_by_name_not_hardcoded_id(tmp_path):
-    """Zotero renumbers itemTypeIDs across major versions (it did so in 9).
+    """Zotero assigns itemTypeIDs per database; no numbering is stable.
 
-    Here 'attachment' and 'note' carry IDs 40/41, not the historical 14/26.
+    Here 'attachment' and 'note' carry IDs 40/41, not upstream's assumed 14/26.
     Resolving by name keeps them excluded; a hardcoded (14, 26) would leak an
     attachment into the paper list.
     """

@@ -5,10 +5,13 @@ from typing import Optional
 
 ZOTERO_DB = Path.home() / "Zotero" / "zotero.sqlite"
 # Item types excluded from all paper-level queries: neither is a citable paper.
-# Resolved by name at runtime -- Zotero's numeric IDs are an internal detail and
-# were renumbered wholesale in Zotero 9.
+# Resolved by name at runtime -- Zotero assigns numeric IDs per database, from the
+# global schema's order when the itemTypes table is built or migrated, so they are
+# not stable across Zotero versions or profile histories.
 EXCLUDED_TYPE_NAMES = ("attachment", "note")
-# Only used if the itemTypes table cannot be read (values as of Zotero 7-9).
+# Last resort if the itemTypes table cannot be read: upstream's original literals.
+# No known numbering makes both correct (see FORK-CHANGES.md); kept only so that
+# failure mode degrades to upstream's behaviour rather than a crash.
 _EXCLUDED_TYPES_FALLBACK = (14, 26)
 
 

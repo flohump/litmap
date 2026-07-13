@@ -4,8 +4,8 @@
 >
 > Forked from [`dougwyu/litmap`](https://github.com/dougwyu/litmap) at `efc3c2a6`.
 > **[`FORK-CHANGES.md`](FORK-CHANGES.md) lists what differs and why** — including four
-> bugs that silently corrupt the search index on any Zotero 9 library, and a
-> retrieval change measured against planted answers ([`docs/VALIDATION.md`](docs/VALIDATION.md)).
+> bugs that silently corrupt the search index, and a retrieval change measured
+> against planted answers ([`docs/VALIDATION.md`](docs/VALIDATION.md)).
 >
 > If you are running upstream litmap today, the thirty-second read-only check in
 > `FORK-CHANGES.md` will tell you how much of your index is not papers. On the

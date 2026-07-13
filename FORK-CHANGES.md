@@ -17,10 +17,15 @@ seriously even if you do not want the retrieval changes.
 
 ### Attachments were embedded as papers
 
-`zotero.py` excluded item types with the literals `itemTypeID NOT IN (14, 26)`.
-Those IDs were correct for Zotero 7-8. **Zotero 9 renumbered every item type.** On a
-current library, `attachment` is 3 and `note` is 27; `14` and `26` are `email` and
-`newspaperArticle`. So the filter excluded emails and newspaper articles while
+`zotero.py` excluded item types with the literals `itemTypeID NOT IN (14, 26)`,
+commented `14 = attachment, 26 = note`. But item-type IDs are not stable constants.
+Zotero assigns them per database, from the order of the global schema at the moment
+the `itemTypes` table is first built or migrated, so they vary across Zotero versions
+and across profile histories and were never safe to hard-code. No reconstructable
+schema order makes `14` and `26` resolve to `attachment` and `note` together, so
+those literals were plausibly never correct in any real database. On a current
+Zotero 9 library, `attachment` is 3 and `note` is 27, while `14` and `26` are `email`
+and `newspaperArticle`. So the filter excluded emails and newspaper articles while
 letting every attachment through — and an attachment's "title" is its PDF filename.
 
 Measured on one real library: **644 attachments** embedded as papers, and every
@@ -64,6 +69,38 @@ Together these accounted for **1,382 of 2,898 rows (48%) of a real index**: 644
 attachments, 606 orphans, 116 feed items, 16 trashed. Every search ranked real
 papers against them. The library holds 1,607 papers — 320 in My Library and 1,287
 across two group libraries.
+
+### Check your own index
+
+This is read-only: it installs nothing and modifies neither database. The two
+paths below are litmap's defaults; adjust them if yours differ.
+
+```bash
+python3 - <<'PY'
+import sqlite3, os
+from collections import Counter
+emb = sqlite3.connect(f"file:{os.path.expanduser('~/LitLake/embeddings.db')}?mode=ro", uri=True)
+zot = sqlite3.connect(f"file:{os.path.expanduser('~/Zotero/zotero.sqlite')}?immutable=1", uri=True)
+keys  = {r[0] for r in emb.execute("SELECT zotero_key FROM embeddings")}
+types = dict(zot.execute("SELECT i.key, it.typeName FROM items i JOIN itemTypes it ON it.itemTypeID=i.itemTypeID"))
+trash = {r[0] for r in zot.execute("SELECT i.key FROM items i JOIN deletedItems d ON d.itemID=i.itemID")}
+feed  = {r[0] for r in zot.execute("SELECT i.key FROM items i JOIN libraries l ON l.libraryID=i.libraryID WHERE l.type='feed'")}
+c = Counter()
+for k in keys:
+    t = types.get(k)
+    c["orphan (deleted from Zotero)" if t is None else
+      f"NOT A PAPER: {t}" if t in ("attachment", "note") else
+      "journal feed item" if k in feed else
+      "trashed" if k in trash else "paper"] += 1
+for label, n in sorted(c.items(), key=lambda x: -x[1]):
+    print(f"{n:>6}  {label}")
+junk = sum(v for k, v in c.items() if k != "paper")
+print(f"\n{junk} of {len(keys)} rows ({junk/len(keys):.0%}) are not papers")
+PY
+```
+
+On the library that prompted this fork, that printed `1382 of 2898 rows (48%) are
+not papers`; after the fork's `sync` it prints `0 of 1607 rows (0%)`.
 
 ### Authorship order, and vanishing institutional authors
 
