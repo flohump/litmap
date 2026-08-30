@@ -19,6 +19,13 @@ def _fatal(message: str, code: int = 1) -> None:
 
 
 def _auto_sync(db_path: Path, zotero_db: Path) -> None:
+    # Read-only consumer mode: when LITMAP_NO_SYNC is set, skip the implicit
+    # pre-search sync so a machine whose embeddings.db arrives via a receive-only
+    # Syncthing folder never writes to it. Explicit `sync` / `sync-fulltext` are
+    # unaffected: they call sync() directly, not through here.
+    import os
+    if os.environ.get("LITMAP_NO_SYNC"):
+        return
     from litmap.embedder import sync, ModelMismatchError
     try:
         sync(db_path, zotero_db)
