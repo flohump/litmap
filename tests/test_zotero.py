@@ -1,7 +1,9 @@
 from litmap.zotero import get_all_items, get_collection, get_item, Item
 
 
-def test_get_all_items_excludes_attachments(zotero_db):
+def test_get_all_items_excludes_attachments(zotero_db, monkeypatch):
+    # Span every library: this test is about type/trash/feed exclusion, not scope.
+    monkeypatch.setenv("LITMAP_LIBRARY_IDS", "all")
     items = get_all_items(zotero_db)
     # 3 user-library papers + 1 group-library paper. The attachment, the trashed
     # paper and the journal-feed item are all excluded.

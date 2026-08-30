@@ -431,6 +431,8 @@ def test_cluster_cmd_warns_on_unembedded_papers(
 
     # Skip auto-sync so unembedded papers stay unembedded (no real model call).
     monkeypatch.setattr(cli_module, "_auto_sync", lambda *a, **k: None)
+    # Span every library: the paper set here deliberately includes the group paper.
+    monkeypatch.setenv("LITMAP_LIBRARY_IDS", "all")
 
     # Add a 4th journalArticle to zotero with no embedding. The full set then
     # has 4 papers but only 3 are embedded, so 1 should be skipped with a warning.

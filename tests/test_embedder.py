@@ -42,7 +42,9 @@ def test_get_embedding_returns_none_for_missing(embeddings_db):
     assert result is None
 
 
-def test_sync_embeds_only_new_items(zotero_db, tmp_path):
+def test_sync_embeds_only_new_items(zotero_db, tmp_path, monkeypatch):
+    # Span every library: this test is about incremental sync, not scope.
+    monkeypatch.setenv("LITMAP_LIBRARY_IDS", "all")
     db_path = tmp_path / "embeddings.db"
     init_db(db_path)
     with patch("litmap.embedder._get_model") as mock_model:

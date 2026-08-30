@@ -1,9 +1,14 @@
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import sqlite3
 from typing import Optional
 
 ZOTERO_DB = Path.home() / "Zotero" / "zotero.sqlite"
+# Index only the Personal library by default. A large shared group library
+# otherwise swamps a curated personal one and pollutes every search result.
+# Widen deliberately with LITMAP_LIBRARY_IDS="1,579642", or "all" for every library.
+PERSONAL_LIBRARY_ID = 1
 # Item types excluded from all paper-level queries: neither is a citable paper.
 # Resolved by name at runtime -- Zotero assigns numeric IDs per database, from the
 # global schema's order when the itemTypes table is built or migrated, so they are
@@ -84,9 +89,38 @@ def _feed_clause(conn: sqlite3.Connection) -> str:
     return ""
 
 
+def configured_library_ids() -> Optional[tuple[int, ...]]:
+    """Libraries to index, or None for every library.
+
+    Defaults to the Personal library alone; LITMAP_LIBRARY_IDS overrides.
+    """
+    raw = os.environ.get("LITMAP_LIBRARY_IDS")
+    if raw is None:
+        return (PERSONAL_LIBRARY_ID,)
+    if raw.strip().lower() == "all":
+        return None
+    try:
+        ids = tuple(int(part) for part in raw.split(",") if part.strip())
+    except ValueError:
+        raise ValueError(
+            f"LITMAP_LIBRARY_IDS must be comma-separated integers or 'all', got {raw!r}"
+        ) from None
+    if not ids:
+        raise ValueError("LITMAP_LIBRARY_IDS is empty; unset it or use 'all'")
+    return ids
+
+
+def _library_clause(conn: sqlite3.Connection) -> str:
+    """SQL restricting items to the configured libraries."""
+    ids = configured_library_ids()
+    if ids is None:
+        return ""
+    return " AND i.libraryID IN (" + ",".join(str(i) for i in ids) + ")"
+
+
 def _exclusions(conn: sqlite3.Connection) -> str:
     """Everything that is in `items` but is not one of the user's papers."""
-    return _trash_clause(conn) + _feed_clause(conn)
+    return _trash_clause(conn) + _feed_clause(conn) + _library_clause(conn)
 
 
 def _excluded_type_ids(conn: sqlite3.Connection) -> tuple[int, ...]:

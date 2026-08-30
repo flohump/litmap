@@ -76,10 +76,34 @@ def test_feed_items_are_not_indexed(zotero_db):
     assert "FEEDITEM1" not in keys
 
 
-def test_group_library_papers_are_still_indexed(zotero_db):
-    """Guard against over-exclusion: only `feed` libraries go, not every non-user one."""
+def test_group_library_papers_are_excluded_by_default(zotero_db):
+    """Default scope is the Personal library: a shared group library swamps it."""
+    keys = {i.key for i in get_all_items(zotero_db)}
+    assert "GROUPPAPR" not in keys
+    assert "AAAA0001" in keys
+
+
+def test_group_library_papers_return_when_widened(zotero_db, monkeypatch):
+    monkeypatch.setenv("LITMAP_LIBRARY_IDS", "1,7")
     keys = {i.key for i in get_all_items(zotero_db)}
     assert "GROUPPAPR" in keys
+    assert "AAAA0001" in keys
+
+
+def test_library_ids_all_keeps_feeds_excluded(zotero_db, monkeypatch):
+    """Guard against under-exclusion: widening to every library must not re-admit feeds."""
+    monkeypatch.setenv("LITMAP_LIBRARY_IDS", "all")
+    keys = {i.key for i in get_all_items(zotero_db)}
+    assert "GROUPPAPR" in keys
+    assert "FEEDITEM1" not in keys
+
+
+def test_library_ids_rejects_garbage(monkeypatch):
+    from litmap.zotero import configured_library_ids
+
+    monkeypatch.setenv("LITMAP_LIBRARY_IDS", "1,notanint")
+    with pytest.raises(ValueError):
+        configured_library_ids()
 
 
 def test_get_item_refuses_a_feed_key(zotero_db):
